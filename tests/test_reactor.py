@@ -82,7 +82,7 @@ class Client(IOHandler):
         if echo != "":
             assert echo == self.msg, "client got '" + echo + "' want '" + self.msg + "'"
             self.box.done += 1
-            print("client echoed:", echo, "(done", self.box.done, "of", self.box.total, ")")
+            print("client echoed:", echo, "done", self.box.done, "of", self.box.total, flush=True)
             self.r.unregister(self.fd)
             self.sock.close()
             if self.box.done == self.box.total:
@@ -95,7 +95,7 @@ class Watchdog(TimerCallback):
         self.r = r
         self.box = box
     def run(self):
-        print("WATCHDOG fired; clients done =", self.box.done)
+        print("WATCHDOG fired; clients done =", self.box.done, flush=True)
         self.r.stop()
 
 def main():
@@ -114,9 +114,9 @@ def main():
         clients.append(cs)
 
     r.call_later(8.0, Watchdog(r, box))    # safety timeout
-    print("entering run_forever; clients:", NCLIENTS)
+    print("entering run_forever; clients:", NCLIENTS, flush=True)
     r.run_forever()
-    print("run_forever returned; done =", box.done)
+    print("run_forever returned; done =", box.done, flush=True)
 
     print("clients echoed:", box.done, "/", NCLIENTS)
     assert box.done == NCLIENTS, "not all clients completed"
