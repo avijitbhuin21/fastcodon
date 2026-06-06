@@ -25,9 +25,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Codon (upstream release)
+      - name: Install Codon (upstream release tarball)
+        # Download the prebuilt tarball directly. (The official install.sh runs an interactive
+        # `read -p` to edit a shell profile, which hits EOF under `set -e` on CI and fails the
+        # step even though extraction succeeded — so we skip it.)
         run: |
-          /bin/bash -c "$(curl -fsSL https://exaloop.io/install.sh)"
+          set -euo pipefail
+          os=$(uname -s | awk '{print tolower($0)}')
+          arch=$(uname -m)
+          url="https://github.com/exaloop/codon/releases/latest/download/codon-$os-$arch.tar.gz"
+          echo "downloading $url"
+          mkdir -p "$HOME/.codon"
+          curl -fL "$url" | tar xz -C "$HOME/.codon" --strip-components=1
           echo "$HOME/.codon/bin" >> "$GITHUB_PATH"
 
       - name: Codon version
