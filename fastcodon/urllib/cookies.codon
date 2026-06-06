@@ -1,0 +1,50 @@
+# fastcodon.urllib.cookies — RFC 6265 cookie parsing/serialization (pure Codon).
+
+def parse_cookie(header_value: str) -> Dict[str, str]:
+    out = Dict[str, str]()
+    if len(header_value) == 0:
+        return out
+    parts = header_value.split(";")
+    for raw in parts:
+        item = raw.strip()
+        if len(item) == 0:
+            continue
+        if "=" in item:
+            idx = item.find("=")
+            k = item[:idx].strip()
+            v = item[idx + 1:].strip()
+            # Strip surrounding double quotes on the value, if present.
+            if len(v) >= 2 and v[0] == '"' and v[len(v) - 1] == '"':
+                v = v[1:len(v) - 1]
+            if len(k) > 0:
+                out[k] = v
+        else:
+            # Bare token with no '=' -> empty value.
+            out[item] = ""
+    return out
+
+def dump_cookie(name: str, value: str,
+                path: str = "/",
+                max_age: int = -1,
+                http_only: bool = False,
+                secure: bool = False,
+                same_site: str = "",
+                domain: str = "",
+                expires: str = "") -> str:
+    chunks = List[str]()
+    chunks.append(name + "=" + value)
+    if len(path) > 0:
+        chunks.append("Path=" + path)
+    if len(domain) > 0:
+        chunks.append("Domain=" + domain)
+    if max_age >= 0:
+        chunks.append("Max-Age=" + str(max_age))
+    if len(expires) > 0:
+        chunks.append("Expires=" + expires)
+    if len(same_site) > 0:
+        chunks.append("SameSite=" + same_site)
+    if secure:
+        chunks.append("Secure")
+    if http_only:
+        chunks.append("HttpOnly")
+    return "; ".join(chunks)

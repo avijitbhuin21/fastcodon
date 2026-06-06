@@ -1,0 +1,144 @@
+# fastcodon.json.value — the recursive tagged-union JSON value type.
+#
+# Codon is statically typed, so a JSON value cannot be a dynamic Python object. We model it as a
+# recursive class with an integer `kind` tag plus storage fields. Arrays/objects hold List/Dict of
+# the same class, which Codon supports via recursive class references.
+
+# Kind tags.
+NULL   = 0
+BOOL   = 1
+INT    = 2
+FLOAT  = 3
+STR    = 4
+ARRAY  = 5
+OBJECT = 6
+
+
+class JsonValue:
+    kind: int
+    b: bool
+    i: int
+    f: float
+    s: str
+    arr: List[JsonValue]
+    obj: Dict[str, JsonValue]
+
+    def __init__(self, kind: int = NULL):
+        self.kind = kind
+        self.b = False
+        self.i = 0
+        self.f = 0.0
+        self.s = ""
+        self.arr = List[JsonValue]()
+        self.obj = Dict[str, JsonValue]()
+
+    # ---- constructors ----
+    @staticmethod
+    def null() -> JsonValue:
+        return JsonValue(NULL)
+
+    @staticmethod
+    def from_bool(v: bool) -> JsonValue:
+        x = JsonValue(BOOL)
+        x.b = v
+        return x
+
+    @staticmethod
+    def from_int(v: int) -> JsonValue:
+        x = JsonValue(INT)
+        x.i = v
+        return x
+
+    @staticmethod
+    def from_float(v: float) -> JsonValue:
+        x = JsonValue(FLOAT)
+        x.f = v
+        return x
+
+    @staticmethod
+    def from_str(v: str) -> JsonValue:
+        x = JsonValue(STR)
+        x.s = v
+        return x
+
+    @staticmethod
+    def array(items: List[JsonValue]) -> JsonValue:
+        x = JsonValue(ARRAY)
+        x.arr = items
+        return x
+
+    @staticmethod
+    def object(items: Dict[str, JsonValue]) -> JsonValue:
+        x = JsonValue(OBJECT)
+        x.obj = items
+        return x
+
+    # ---- kind checks ----
+    def is_null(self) -> bool:
+        return self.kind == NULL
+
+    def is_bool(self) -> bool:
+        return self.kind == BOOL
+
+    def is_int(self) -> bool:
+        return self.kind == INT
+
+    def is_float(self) -> bool:
+        return self.kind == FLOAT
+
+    def is_str(self) -> bool:
+        return self.kind == STR
+
+    def is_array(self) -> bool:
+        return self.kind == ARRAY
+
+    def is_object(self) -> bool:
+        return self.kind == OBJECT
+
+    # ---- accessors ----
+    def as_bool(self) -> bool:
+        if self.kind != BOOL:
+            raise ValueError("JsonValue is not a bool")
+        return self.b
+
+    def as_int(self) -> int:
+        if self.kind == INT:
+            return self.i
+        if self.kind == FLOAT:
+            return int(self.f)
+        raise ValueError("JsonValue is not a number")
+
+    def as_float(self) -> float:
+        if self.kind == FLOAT:
+            return self.f
+        if self.kind == INT:
+            return float(self.i)
+        raise ValueError("JsonValue is not a number")
+
+    def as_str(self) -> str:
+        if self.kind != STR:
+            raise ValueError("JsonValue is not a string")
+        return self.s
+
+    def as_list(self) -> List[JsonValue]:
+        if self.kind != ARRAY:
+            raise ValueError("JsonValue is not an array")
+        return self.arr
+
+    def as_dict(self) -> Dict[str, JsonValue]:
+        if self.kind != OBJECT:
+            raise ValueError("JsonValue is not an object")
+        return self.obj
+
+    # ---- convenience ----
+    def __getitem__(self, key: str) -> JsonValue:
+        return self.obj[key]
+
+    def __len__(self) -> int:
+        if self.kind == ARRAY:
+            return len(self.arr)
+        if self.kind == OBJECT:
+            return len(self.obj)
+        if self.kind == STR:
+            return len(self.s)
+        return 0

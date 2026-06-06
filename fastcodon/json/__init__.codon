@@ -1,0 +1,8 @@
+# fastcodon.json — P21: a pure-Codon RFC 8259 JSON encoder + decoder (no FFI).
+#
+# JSON values are modelled as a recursive tagged-union class `JsonValue` (static typing means no
+# dynamic Python objects). `loads` parses str -> JsonValue; `dumps` serialises JsonValue -> str.
+from .value import (JsonValue,
+                    NULL, BOOL, INT, FLOAT, STR, ARRAY, OBJECT)
+from .decoder import loads
+from .encoder import dumps

@@ -1,0 +1,6 @@
+# fastcodon.urllib — P22: URL/percent-encoding, query strings, cookies, HTTP dates.
+# Pure Codon (no FFI). RFC 3986 / RFC 6265 / RFC 7231.
+from .url import quote, unquote, quote_plus, unquote_plus
+from .querystring import parse_qs, parse_qsl, urlencode
+from .cookies import parse_cookie, dump_cookie
+from .httpdate import format_http_date, parse_http_date

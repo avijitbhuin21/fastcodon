@@ -24,20 +24,33 @@ interpreter, no Rust `pydantic-core`, no C extension shims). The output is a Cod
 > (P11), `fastcodon/net/selector.codon` (P12), `fastcodon/crypto/*` (P13), `fastcodon/tls/*` (P14),
 > and the async reactor `fastcodon/reactor.codon` (P31).
 >
-> **Cross-platform verification matrix:**
-> - **Windows** x86_64 — ✔️ *runtime-verified* (JIT + native AOT): non-blocking TCP echo, selector
->   echo, RFC crypto vectors, a 5-client async echo server, and a real **TLS 1.3 handshake + HTTPS GET**.
-> - **Linux x86_64** & **Linux arm64** (glibc) — ✔️ *runtime-verified on real CI runners* (stock
->   upstream Codon v0.19.6) via `.github/workflows/leaves-ci.yml`: sockets, selector, crypto, and
->   the async reactor all green. Repo: `github.com/avijitbhuin21/fastcodon`.
-> - **macOS arm64/x86_64** — same CI matrix (running). Plus all four platforms were *static-verified*:
->   POSIX/`__apple__` branches compile to correct LLVM IR (right per-OS symbols — `poll`,
->   `__errno_location` on Linux vs `__error` on macOS, **zero** Windows symbols) and every
->   platform-divergent constant was audited against system headers.
+> **The full L2 codec layer is now DONE** (all pure-Codon, JIT-verified green on Windows): JSON
+> enc/dec `fastcodon/json/*` (P21), URL/query/cookies/HTTP-dates `fastcodon/urllib/*` (P22), the
+> sans-I/O HTTP/1.1 parser `fastcodon/http/*` (P23), the WebSocket frame codec + handshake
+> `fastcodon/websocket/*` (P24), and the multipart/form-data parser `fastcodon/multipart/*` (P25).
+> **L3 async streams** `fastcodon/aio/*` (P32) is also DONE — buffered read/write with backpressure
+> over the callback reactor (Completion/Continuation objects, since Codon has no `await`), verified
+> with a real loopback echo; a timeout primitive seeds P33. Each component ships a green test in
+> `tests/` (`test_json`, `test_urllib`, `test_http`, `test_websocket`, `test_multipart`,
+> `test_streams`). Whole suite: 10/10 tests pass.
 >
-> Two real portability bugs were caught and fixed by this CI vs. the Windows-fork build: stock Codon
-> uses `str.ptr`/`.len` (fork uses `_ptr`/`_len`) — fixed by going through the public `ord()`/
-> `str(ptr,len)` API (`fastcodon/sys/buf.codon`); and stock Codon's parser rejects `0o` octal literals.
+> **Cross-platform verification matrix — runtime-verified on real hardware/CI:**
+> - **Windows** x86_64 — ✔️ JIT + native AOT: TCP echo, selector echo, RFC crypto vectors, a
+>   5-client async echo server, and a real **TLS 1.3 handshake + HTTPS GET**.
+> - **Linux x86_64** — ✔️ green on CI runner (stock upstream Codon v0.19.6).
+> - **Linux arm64** (glibc) — ✔️ green on CI runner.
+> - **macOS arm64** (Apple Silicon) — ✔️ green on CI runner.
+> - **macOS x86_64** — same code; CI gated on a (scarce, deprecated) Intel runner.
+>
+> CI: `.github/workflows/leaves-ci.yml` on `github.com/avijitbhuin21/fastcodon`. Three real bugs
+> that the Windows-only build masked were caught and fixed by running on real Linux/macOS:
+> 1. stock Codon uses `str.ptr`/`.len` (the fork uses `_ptr`/`_len`) → access bytes only via the
+>    public `ord()`/`str(ptr,len)` API (`fastcodon/sys/buf.codon`);
+> 2. stock Codon's parser rejects `0o` octal literals → use decimal;
+> 3. **Apple-arm64 variadic ABI:** `fcntl(int,int,...)` passes varargs on the *stack* on Apple
+>    Silicon, so a fixed-arity FFI decl put `O_NONBLOCK` in a register → `setblocking()` silently
+>    failed → `accept()` blocked and hung the reactor. Fixed by declaring `fcntl` variadic (`...`).
+>    (x86_64 and Linux-arm64 pass varargs in registers, so only Apple Silicon was affected.)
 >
 > See `codon-libraries/README.md` for the toolchain + how to build/run.
 
@@ -64,21 +77,21 @@ the FastAPI feature that requires it, so nothing is built that the graph doesn't
 
 | Component | Source | Status | Phase | Done | Need-it-for |
 |-----------|--------|:------:|:-----:|:----:|-------------|
-| JSON encoder + decoder | pure-Codon | ❌ build | `P21` | ⬜ | Request/response bodies, Pydantic, OpenAPI |
-| URL / percent-encoding / query-string | pure-Codon | ❌ build | `P22` | ⬜ | Routing, `QueryParams`, `url_for` |
-| Cookies (parse/serialize) | pure-Codon | ❌ build | `P22` | ⬜ | Sessions, `Cookie` params |
-| HTTP date formatting (RFC 7231) | pure-Codon (`datetime`✓) | ❌ build | `P22` | ⬜ | Response headers |
-| HTTP/1.1 parser (sans-io state machine) | pure-Codon | ❌ build | `P23` | ⬜ | The HTTP transport |
-| WebSocket frame codec + handshake (RFC 6455) | pure-Codon (`P13`) | ❌ build | `P24` | ⬜ | WebSocket support |
-| multipart/form-data parser | pure-Codon | ❌ build | `P25` | ⬜ | `Form`/`File` uploads |
+| JSON encoder + decoder | pure-Codon | ❌ build | `P21` | ✔️ | Request/response bodies, Pydantic, OpenAPI |
+| URL / percent-encoding / query-string | pure-Codon | ❌ build | `P22` | ✔️ | Routing, `QueryParams`, `url_for` |
+| Cookies (parse/serialize) | pure-Codon | ❌ build | `P22` | ✔️ | Sessions, `Cookie` params |
+| HTTP date formatting (RFC 7231) | pure-Codon (`datetime`✓) | ❌ build | `P22` | ✔️ | Response headers |
+| HTTP/1.1 parser (sans-io state machine) | pure-Codon | ❌ build | `P23` | ✔️ | The HTTP transport |
+| WebSocket frame codec + handshake (RFC 6455) | pure-Codon (`P13`) | ❌ build | `P24` | ✔️ | WebSocket support |
+| multipart/form-data parser | pure-Codon | ❌ build | `P25` | ✔️ | `Form`/`File` uploads |
 
 ### L3 — Async runtime (reactor + anyio-equivalent)
 
 | Component | Source | Status | Phase | Done | Need-it-for |
 |-----------|--------|:------:|:-----:|:----:|-------------|
 | Async I/O reactor (Handler-based loop + timers over the Selector) | pure-Codon (`P12`) | ❌ build | `P31` | ✔️ | All async I/O |
-| Async socket streams (read/write coros, backpressure) | pure-Codon (`P31`,`P14`) | ❌ build | `P32` | ⬜ | HTTP/WS transports |
-| anyio-equiv: task groups, cancel scopes, timeouts, memory streams | pure-Codon (`threading`✓) | ❌ build | `P33` | ⬜ | Structured concurrency, Starlette |
+| Async socket streams (read/write coros, backpressure) | pure-Codon (`P31`,`P14`) | ❌ build | `P32` | ✔️ | HTTP/WS transports |
+| anyio-equiv: task groups, cancel scopes, timeouts, memory streams | pure-Codon (`threading`✓) | ❌ build | `P33` | 🔄 | Structured concurrency, Starlette — timeout primitive seeded (`aio/timeout.codon`); task groups/cancel scopes next |
 
 ### L4 — Protocol servers (uvicorn-equivalent)
 

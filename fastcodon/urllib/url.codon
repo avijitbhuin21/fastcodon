@@ -1,0 +1,121 @@
+# fastcodon.urllib.url — RFC 3986 percent-encoding (pure Codon, UTF-8 byte-wise).
+from ..sys.buf import str_to_ptr, bytes_to_str
+
+_HEX = "0123456789ABCDEF"
+
+def _is_unreserved(c: int) -> bool:
+    # ALPHA / DIGIT / '-' '.' '_' '~'
+    if 65 <= c <= 90:      # A-Z
+        return True
+    if 97 <= c <= 122:     # a-z
+        return True
+    if 48 <= c <= 57:      # 0-9
+        return True
+    if c == 45 or c == 46 or c == 95 or c == 126:  # - . _ ~
+        return True
+    return False
+
+def _safe_set(safe: str) -> List[bool]:
+    # Build a 256-wide lookup of bytes that must NOT be encoded.
+    tbl = [False for _ in range(256)]
+    c = 0
+    while c < 256:
+        tbl[c] = _is_unreserved(c)
+        c += 1
+    sp = str_to_ptr(safe)
+    i = 0
+    while i < len(safe):
+        tbl[int(sp[i])] = True
+        i += 1
+    return tbl
+
+def quote(s: str, safe: str = "/") -> str:
+    tbl = _safe_set(safe)
+    sp = str_to_ptr(s)
+    out = List[byte]()
+    i = 0
+    n = len(s)
+    while i < n:
+        c = int(sp[i])
+        if tbl[c]:
+            out.append(byte(c))
+        else:
+            out.append(byte(37))  # '%'
+            out.append(byte(ord(_HEX[c >> 4])))
+            out.append(byte(ord(_HEX[c & 15])))
+        i += 1
+    return bytes_to_str(out)
+
+def quote_plus(s: str, safe: str = "") -> str:
+    # Spaces become '+'; everything else like quote() but with '+' reserved.
+    if " " in s:
+        # Encode using quote with space treated specially.
+        tbl = _safe_set(safe)
+        sp = str_to_ptr(s)
+        out = List[byte]()
+        i = 0
+        n = len(s)
+        while i < n:
+            c = int(sp[i])
+            if c == 32:           # space -> '+'
+                out.append(byte(43))
+            elif tbl[c]:
+                out.append(byte(c))
+            else:
+                out.append(byte(37))
+                out.append(byte(ord(_HEX[c >> 4])))
+                out.append(byte(ord(_HEX[c & 15])))
+            i += 1
+        return bytes_to_str(out)
+    return quote(s, safe)
+
+def _hexval(c: int) -> int:
+    # Return 0..15 for a hex digit byte, or -1 if invalid.
+    if 48 <= c <= 57:      # 0-9
+        return c - 48
+    if 65 <= c <= 70:      # A-F
+        return c - 65 + 10
+    if 97 <= c <= 102:     # a-f
+        return c - 97 + 10
+    return -1
+
+def unquote(s: str) -> str:
+    sp = str_to_ptr(s)
+    out = List[byte]()
+    i = 0
+    n = len(s)
+    while i < n:
+        c = int(sp[i])
+        if c == 37:           # '%'
+            hi = _hexval(int(sp[i + 1])) if i + 1 < n else -1
+            lo = _hexval(int(sp[i + 2])) if i + 2 < n else -1
+            if hi >= 0 and lo >= 0:
+                out.append(byte((hi << 4) | lo))
+                i += 3
+                continue
+        out.append(byte(c))
+        i += 1
+    return bytes_to_str(out)
+
+def unquote_plus(s: str) -> str:
+    # '+' -> space, then percent-decode.
+    sp = str_to_ptr(s)
+    out = List[byte]()
+    i = 0
+    n = len(s)
+    while i < n:
+        c = int(sp[i])
+        if c == 43:           # '+'
+            out.append(byte(32))
+            i += 1
+            continue
+        if c == 37:           # '%'
+            hi = _hexval(int(sp[i + 1])) if i + 1 < n else -1
+            lo = _hexval(int(sp[i + 2])) if i + 2 < n else -1
+            if hi >= 0 and lo >= 0:
+                out.append(byte((hi << 4) | lo))
+                i += 3
+                continue
+        out.append(byte(c))
+        i += 1
+    return bytes_to_str(out)

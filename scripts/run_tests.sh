@@ -42,12 +42,21 @@ run_test() {
   rm -f "$log"
 }
 
-run_test "sockets (P11)"  test_socket.py    1
-run_test "selector (P12)" test_selector.py  1
-run_test "crypto (P13)"   test_crypto.py    1
-run_test "reactor (P31)"  test_reactor.py   1
+# --- L1 native leaves ---
+run_test "sockets (P11)"   test_socket.py     1
+run_test "selector (P12)"  test_selector.py   1
+run_test "crypto (P13)"    test_crypto.py     1
+run_test "reactor (P31)"   test_reactor.py    1
+# --- L2 pure-Codon codecs (sans-I/O) ---
+run_test "json (P21)"      test_json.py       1
+run_test "urllib (P22)"    test_urllib.py     1
+run_test "http (P23)"      test_http.py       1
+run_test "websocket (P24)" test_websocket.py  1
+run_test "multipart (P25)" test_multipart.py  1
+# --- L3 async streams (real loopback over the reactor) ---
+run_test "streams (P32)"   test_streams.py    1
 # TLS needs system OpenSSL (-lssl -lcrypto) + outbound network; optional in CI.
-run_test "tls (P14)"      test_tls_live.py  0  -l ssl -l crypto
+run_test "tls (P14)"       test_tls_live.py   0  -l ssl -l crypto
 
 echo
 echo "==================== summary: $pass passed, $fail failed ===================="

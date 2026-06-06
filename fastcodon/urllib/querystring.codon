@@ -1,0 +1,36 @@
+# fastcodon.urllib.querystring — RFC 3986 query strings (pure Codon).
+from .url import quote_plus, unquote_plus
+
+def parse_qsl(s: str) -> List[Tuple[str, str]]:
+    out = List[Tuple[str, str]]()
+    if len(s) == 0:
+        return out
+    parts = s.split("&")
+    for raw in parts:
+        if len(raw) == 0:
+            continue
+        if "=" in raw:
+            idx = raw.find("=")
+            k = raw[:idx]
+            v = raw[idx + 1:]
+            out.append((unquote_plus(k), unquote_plus(v)))
+        else:
+            out.append((unquote_plus(raw), ""))
+    return out
+
+def parse_qs(s: str) -> Dict[str, List[str]]:
+    out = Dict[str, List[str]]()
+    for kv in parse_qsl(s):
+        k = kv[0]
+        v = kv[1]
+        if k in out:
+            out[k].append(v)
+        else:
+            out[k] = [v]
+    return out
+
+def urlencode(pairs: List[Tuple[str, str]]) -> str:
+    chunks = List[str]()
+    for kv in pairs:
+        chunks.append(quote_plus(kv[0]) + "=" + quote_plus(kv[1]))
+    return "&".join(chunks)

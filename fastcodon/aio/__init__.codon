@@ -1,0 +1,9 @@
+# fastcodon.aio — P32/P33: the async layer built ON the callback reactor.
+#
+# Public API (import from fastcodon.aio.streams / fastcodon.aio.timeout):
+#   streams: Stream, Completion, Continuation, wrap_stream, connect_stream
+#   timeout: Timeout, TimeoutAction, after
+#
+# Design: there is no async/await; an operation returns a `Completion` result-holder that the
+# reactor fills, and callers attach a `Continuation` object (virtual dispatch, since Codon
+# closures don't unify to one callable type — same idiom as the reactor's IOHandler).

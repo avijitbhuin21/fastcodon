@@ -1,4 +1,5 @@
-# Verifies the fastcodon L1 native leaves (sockets/selector/crypto/reactor/TLS) on REAL
+# Verifies the fastcodon stack — L1 native leaves (sockets/selector/crypto/reactor/TLS),
+# L2 pure-Codon codecs (json/urllib/http/websocket/multipart), and L3 async streams — on REAL
 # Linux and macOS runners (both arches) using stock upstream Codon. This is the cross-platform
 # "deploy for all types" gate for the POSIX backend — the Windows backend is verified separately
 # with the native-Windows Codon build (it isn't in upstream releases yet).
@@ -45,5 +46,5 @@ jobs:
       - name: Generate platform config for this OS
         run: bash scripts/setup.sh
 
-      - name: Run leaf tests (sockets / selector / crypto / reactor / TLS)
+      - name: Run all tests (L1 leaves / L2 codecs / L3 streams / TLS)
         run: bash scripts/run_tests.sh

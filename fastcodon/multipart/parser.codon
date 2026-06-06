@@ -1,0 +1,175 @@
+# fastcodon.multipart.parser — RFC 7578 multipart/form-data parser (pure Codon, sans-I/O).
+#
+# A multipart/form-data body, given a boundary B, is structured as:
+#   --B\r\n  <part0-headers>\r\n\r\n <part0-body> \r\n
+#   --B\r\n  <part1-headers>\r\n\r\n <part1-body> \r\n
+#   --B--                       (final delimiter; optional trailing \r\n)
+#
+# Boundaries appear in the wire as "\r\n--B" (the leading CRLF belongs to the
+# previous part's terminator). The very first "--B" has no leading CRLF.
+#
+# We treat the whole body as bytes (file contents may be binary). Codon's `str`
+# is byte-indexed and `.find`/slicing operate byte-wise, so we use them directly.
+
+class Part:
+    name: str
+    filename: Optional[str]
+    content_type: Optional[str]
+    headers: List[Tuple[str, str]]
+    data: str
+
+    def __init__(self, name: str, filename: Optional[str],
+                 content_type: Optional[str],
+                 headers: List[Tuple[str, str]], data: str):
+        self.name = name
+        self.filename = filename
+        self.content_type = content_type
+        self.headers = headers
+        self.data = data
+
+
+def _unquote(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == '"' and v[len(v) - 1] == '"':
+        return v[1:len(v) - 1]
+    return v
+
+
+def _parse_disposition_params(line: str) -> Dict[str, str]:
+    # line is the full Content-Disposition value, e.g.
+    #   form-data; name="field1"; filename="a.txt"
+    # Split on ';' and pull out key=value pairs. Values may be quoted.
+    params = Dict[str, str]()
+    parts = line.split(";")
+    for p in parts:
+        seg = p.strip()
+        eq = seg.find("=")
+        if eq < 0:
+            continue
+        key = seg[:eq].strip().lower()
+        val = _unquote(seg[eq + 1:])
+        params[key] = val
+    return params
+
+
+def _parse_headers(block: str) -> List[Tuple[str, str]]:
+    # `block` is the raw header section (everything before the blank line),
+    # header lines separated by \r\n. Returns (name, value) preserving case
+    # of values but with names lowercased for lookup convenience downstream.
+    headers = List[Tuple[str, str]]()
+    lines = block.split("\r\n")
+    for ln in lines:
+        if len(ln) == 0:
+            continue
+        colon = ln.find(":")
+        if colon < 0:
+            continue
+        name = ln[:colon].strip()
+        value = ln[colon + 1:].strip()
+        headers.append((name, value))
+    return headers
+
+
+def _build_part(raw: str) -> Optional[Part]:
+    # `raw` is one part's content: headers \r\n\r\n body (no trailing CRLF,
+    # no leading boundary). Returns None for empty/degenerate segments.
+    sep = raw.find("\r\n\r\n")
+    if sep < 0:
+        # No header/body separator: treat whole thing as a headerless body only
+        # if it is non-empty; otherwise skip.
+        if len(raw) == 0:
+            return None
+        header_block = ""
+        body = raw
+    else:
+        header_block = raw[:sep]
+        body = raw[sep + 4:]
+
+    headers = _parse_headers(header_block)
+
+    name = ""
+    filename = None
+    content_type = None
+    for (hn, hv) in headers:
+        low = hn.lower()
+        if low == "content-disposition":
+            params = _parse_disposition_params(hv)
+            if "name" in params:
+                name = params["name"]
+            if "filename" in params:
+                filename = params["filename"]
+        elif low == "content-type":
+            content_type = hv
+
+    return Part(name, filename, content_type, headers, body)
+
+
+def _parse_body(body: str, boundary: str) -> List[Part]:
+    # One-shot parse of a complete body.
+    parts = List[Part]()
+    dash_boundary = "--" + boundary          # opening delimiter
+    crlf_boundary = "\r\n--" + boundary       # subsequent delimiters
+
+    # Find the first opening delimiter.
+    start = body.find(dash_boundary)
+    if start < 0:
+        return parts
+
+    # Advance past the first "--boundary".
+    pos = start + len(dash_boundary)
+    n = len(body)
+
+    while pos <= n:
+        # At `pos` we are right after a "--boundary" token. Two cases:
+        #  - "--" follows  -> this was the closing delimiter, stop.
+        #  - "\r\n" follows -> a part begins after it.
+        if pos + 2 <= n and body[pos:pos + 2] == "--":
+            break
+        # Skip the CRLF after the boundary if present.
+        if pos + 2 <= n and body[pos:pos + 2] == "\r\n":
+            pos += 2
+        # Find the next delimiter ("\r\n--boundary") which terminates this part.
+        nxt = body.find(crlf_boundary, pos)
+        if nxt < 0:
+            # Malformed / truncated: take the rest as the final part.
+            seg = body[pos:]
+            p = _build_part(seg)
+            if p is not None:
+                parts.append(p)
+            break
+        seg = body[pos:nxt]
+        p = _build_part(seg)
+        if p is not None:
+            parts.append(p)
+        # Move past the delimiter token to inspect what follows it.
+        pos = nxt + len(crlf_boundary)
+
+    return parts
+
+
+def parse_multipart(body: str, boundary: str) -> List[Part]:
+    """Parse a complete multipart/form-data body. `boundary` is the raw token
+    from the Content-Type header (without the leading dashes)."""
+    return _parse_body(body, boundary)
+
+
+class MultipartParser:
+    """Streaming parser. Feed arbitrary byte slices via `feed`; call `parts()`
+    when the stream is complete. The boundary may be split across feeds — we
+    buffer the full body and parse once on demand (correct and simple; the
+    sans-I/O contract only requires that arbitrary splits yield identical
+    results)."""
+    boundary: str
+    _buf: str
+    _done: bool
+
+    def __init__(self, boundary: str):
+        self.boundary = boundary
+        self._buf = ""
+        self._done = False
+
+    def feed(self, data: str):
+        self._buf += data
+
+    def parts(self) -> List[Part]:
+        return _parse_body(self._buf, self.boundary)

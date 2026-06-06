@@ -1,0 +1,110 @@
+# fastcodon.aio.timeout — P33 seed: a timeout primitive on the reactor's timer queue.
+#
+# The reactor exposes call_later(delay, cb: TimerCallback) -> TimerEntry, and TimerEntry.cancel().
+# A `Timeout` schedules a TimerCallback that fires after `delay` seconds unless cancelled first.
+# When it fires it invokes a user `TimeoutAction` (a base-class object, virtual dispatch — Codon
+# closures don't unify) so callers can e.g. fail a Completion, close a Stream, or abort an accept.
+# On completion of the guarded operation the caller calls done() to cancel the timer.
+#
+# HOW P33 STRUCTURED CONCURRENCY LAYERS ON THIS:
+#   * CancelScope = a Timeout plus a `cancelled` flag and a list of child operations/Completions.
+#     Its TimeoutAction walks the children and completes each with errored=True (cancellation),
+#     exactly as Stream.close() already fails in-flight Completions. A scope can also be cancelled
+#     manually (cancel()) independent of the deadline.
+#   * TaskGroup = a CancelScope owning N child Streams/operations. When any child errors (or the
+#     deadline fires) the group cancels its scope, propagating cancellation to all siblings; the
+#     group "joins" by polling that every child Completion is done. Because cancellation is just
+#     "complete the Completion with errored=True", continuations already see it through the same
+#     code path as I/O errors — no separate cancellation channel is needed.
+#   * Nested deadlines compose: an inner Timeout with a shorter delay simply fires first; the
+#     outer one is cancelled via done() when its scope exits. Each scope owns exactly one
+#     TimerEntry, so cancellation is O(1) and the reactor's timer queue stays the single source
+#     of time.
+
+from ..reactor import Reactor, TimerCallback, TimerEntry
+
+
+class TimeoutAction:
+    """Override run(); invoked when a Timeout expires (the operation didn't finish in time)."""
+    def run(self):
+        pass
+
+
+class _Flag:
+    """Tiny shared mutable state, held by BOTH the Timeout and its timer callback. Using a shared
+    flag object (rather than the callback referencing Timeout) keeps the type dependency
+    one-directional and avoids a Timeout<->_ExpireCB annotation cycle — Codon resolves
+    class-field annotations eagerly, so a mutual forward reference fails to compile."""
+    finished: bool      # done()/cancel() was called, OR the action has fired
+    expired: bool       # the deadline actually fired
+    def __init__(self):
+        self.finished = False
+        self.expired = False
+
+
+class _ExpireCB(TimerCallback):
+    """Reactor timer callback: on fire, if not already disarmed, run the user action once."""
+    flag: _Flag
+    action: TimeoutAction
+
+    def __init__(self, flag: _Flag, action: TimeoutAction):
+        self.flag = flag
+        self.action = action
+
+    def run(self):
+        if self.flag.finished:
+            return            # disarmed between scheduling and dispatch; ignore
+        self.flag.expired = True
+        self.flag.finished = True
+        self.action.run()
+
+
+class Timeout:
+    """Fires `action` after `delay` seconds unless done()/cancel() is called first.
+
+    Usage:
+        t = Timeout(reactor, 5.0, MyAction(...)).start()   # arm
+        ... when the guarded op completes:
+        t.done()                                            # disarm; action will NOT fire
+    """
+    r: Reactor
+    delay: float
+    action: TimeoutAction
+    flag: _Flag
+    entry: Optional[TimerEntry]
+
+    def __init__(self, r: Reactor, delay: float, action: TimeoutAction):
+        self.r = r
+        self.delay = delay
+        self.action = action
+        self.flag = _Flag()
+        self.entry = None
+
+    @property
+    def expired(self) -> bool:
+        return self.flag.expired
+
+    def start(self) -> Timeout:
+        """Arm the timer. Returns self for chaining."""
+        if self.entry is None and not self.flag.finished:
+            self.entry = self.r.call_later(self.delay, _ExpireCB(self.flag, self.action))
+        return self
+
+    def done(self):
+        """The guarded operation finished in time: cancel the pending timeout (action won't run)."""
+        if self.flag.finished:
+            return
+        self.flag.finished = True
+        e = self.entry
+        if e is not None:
+            e.cancel()
+            self.entry = None
+
+    def cancel(self):
+        """Alias for done(): disarm without firing the action."""
+        self.done()
+
+
+def after(r: Reactor, delay: float, action: TimeoutAction) -> Timeout:
+    """Convenience: build and arm a Timeout in one call."""
+    return Timeout(r, delay, action).start()

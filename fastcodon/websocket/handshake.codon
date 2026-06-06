@@ -1,0 +1,24 @@
+# fastcodon.websocket.handshake — RFC 6455 §1.3 opening handshake.
+# Computes Sec-WebSocket-Accept and builds the 101 Switching Protocols response.
+# Pure Codon; reuses the crypto leaf (SHA-1 + base64).
+from ..crypto import sha1, b64encode
+
+# RFC 6455 §1.3 magic GUID appended to the client key before hashing.
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def accept_key(client_key: str) -> str:
+    """Sec-WebSocket-Accept = base64(sha1(client_key + GUID)).
+
+    RFC 6455 §1.3 vector:
+      accept_key("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    """
+    return b64encode(sha1(client_key + _WS_GUID))
+
+def build_handshake_response(client_key: str) -> str:
+    """Build the full HTTP/1.1 101 Switching Protocols response for `client_key`."""
+    accept = accept_key(client_key)
+    return ("HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: " + accept + "\r\n"
+            "\r\n")

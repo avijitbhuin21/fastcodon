@@ -16,6 +16,19 @@ The **L1 native leaves are done and verified** (the foundation everything else s
 | **TLS** (P14) | `fastcodon/tls/*` | OpenSSL 3.x wrapper, non-blocking handshake | ✔️ live TLS 1.3 + HTTPS GET |
 | **Reactor** (P31) | `fastcodon/reactor.codon` | Async event loop: I/O handlers + timers | ✔️ 5-client async echo server |
 
+The **L2 pure-Codon codec layer** and **L3 async streams** are also done and JIT-verified:
+
+| Layer | Module | What it does | Verified |
+|-------|--------|--------------|----------|
+| **JSON** (P21) | `fastcodon/json/*` | RFC 8259 encoder + decoder over a recursive `JsonValue` tagged union | ✔️ round-trip + vectors |
+| **urllib** (P22) | `fastcodon/urllib/*` | percent-encoding, query strings, cookies, RFC 7231 HTTP dates | ✔️ RFC vectors |
+| **HTTP/1.1** (P23) | `fastcodon/http/*` | sans-I/O request parser (Content-Length + chunked, keep-alive, incremental feed) | ✔️ vectors |
+| **WebSocket** (P24) | `fastcodon/websocket/*` | RFC 6455 frame codec + handshake (reuses `crypto`) | ✔️ byte-exact §5.7 vectors |
+| **multipart** (P25) | `fastcodon/multipart/*` | streaming `multipart/form-data` parser | ✔️ vectors |
+| **async streams** (P32) | `fastcodon/aio/*` | buffered read/write + backpressure over the reactor; timeout primitive (P33 seed) | ✔️ loopback echo |
+
+Tests: `test_json` · `test_urllib` · `test_http` · `test_websocket` · `test_multipart` · `test_streams` (all print `PASS:`).
+
 ### Per-platform verification
 
 | Platform | Status |

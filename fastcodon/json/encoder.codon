@@ -1,0 +1,87 @@
+# fastcodon.json.encoder — JsonValue -> str (RFC 8259, compact output).
+from ..sys.buf import byte_at, bytes_to_str
+from .value import JsonValue, NULL, BOOL, INT, FLOAT, STR, ARRAY, OBJECT
+
+_HEX = "0123456789abcdef"
+
+
+def _esc_string(s: str, out: List[byte]):
+    """Append the JSON-quoted, escaped form of `s` (UTF-8 bytes pass through unchanged)."""
+    out.append(byte(34))  # opening quote
+    n = len(s)
+    i = 0
+    while i < n:
+        c = byte_at(s, i)
+        if c == 34:        # "
+            out.append(byte(92)); out.append(byte(34))
+        elif c == 92:      # backslash
+            out.append(byte(92)); out.append(byte(92))
+        elif c == 8:       # \b
+            out.append(byte(92)); out.append(byte(98))
+        elif c == 12:      # \f
+            out.append(byte(92)); out.append(byte(102))
+        elif c == 10:      # \n
+            out.append(byte(92)); out.append(byte(110))
+        elif c == 13:      # \r
+            out.append(byte(92)); out.append(byte(114))
+        elif c == 9:       # \t
+            out.append(byte(92)); out.append(byte(116))
+        elif c < 32:       # other control chars -> \u00XX
+            out.append(byte(92)); out.append(byte(117))  # \u
+            out.append(byte(48)); out.append(byte(48))   # 00
+            out.append(byte(byte_at(_HEX, (c >> 4) & 0xf)))
+            out.append(byte(byte_at(_HEX, c & 0xf)))
+        else:
+            out.append(byte(c))
+        i += 1
+    out.append(byte(34))  # closing quote
+
+
+def _append_str(out: List[byte], s: str):
+    n = len(s)
+    i = 0
+    while i < n:
+        out.append(byte(byte_at(s, i)))
+        i += 1
+
+
+def _encode(v: JsonValue, out: List[byte]):
+    k = v.kind
+    if k == NULL:
+        _append_str(out, "null")
+    elif k == BOOL:
+        _append_str(out, "true" if v.b else "false")
+    elif k == INT:
+        _append_str(out, str(v.i))
+    elif k == FLOAT:
+        _append_str(out, str(v.f))
+    elif k == STR:
+        _esc_string(v.s, out)
+    elif k == ARRAY:
+        out.append(byte(91))  # [
+        first = True
+        for item in v.arr:
+            if not first:
+                out.append(byte(44))  # ,
+            first = False
+            _encode(item, out)
+        out.append(byte(93))  # ]
+    elif k == OBJECT:
+        out.append(byte(123))  # {
+        first = True
+        for key in v.obj:
+            if not first:
+                out.append(byte(44))  # ,
+            first = False
+            _esc_string(key, out)
+            out.append(byte(58))  # :
+            _encode(v.obj[key], out)
+        out.append(byte(125))  # }
+    else:
+        raise ValueError("unknown JsonValue kind")
+
+
+def dumps(v: JsonValue) -> str:
+    out = List[byte]()
+    _encode(v, out)
+    return bytes_to_str(out)

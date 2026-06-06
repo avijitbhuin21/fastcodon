@@ -1,0 +1,82 @@
+# fastcodon.urllib.httpdate — RFC 7231 IMF-fixdate (pure Codon, manual calendar math).
+# Uses Howard Hinnant's days_from_civil / civil_from_days algorithms so the exact
+# vector format_http_date(784111777) == "Sun, 06 Nov 1994 08:49:37 GMT" is guaranteed.
+
+_DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+def _pad2(n: int) -> str:
+    if n < 10:
+        return "0" + str(n)
+    return str(n)
+
+def _days_from_civil(y: int, m: int, d: int) -> int:
+    # Returns number of days since 1970-01-01 (can be negative). m in 1..12.
+    yy = y - (1 if m <= 2 else 0)
+    era = (yy if yy >= 0 else yy - 399) // 400
+    yoe = yy - era * 400                                  # [0, 399]
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1  # [0, 365]
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy         # [0, 146096]
+    return era * 146097 + doe - 719468
+
+def _civil_from_days(z0: int) -> Tuple[int, int, int]:
+    # z = days since 1970-01-01 -> (year, month, day). Inverse of _days_from_civil.
+    z = z0 + 719468
+    era = (z if z >= 0 else z - 146096) // 146097
+    doe = z - era * 146097                                # [0, 146096]
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365  # [0, 399]
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)       # [0, 365]
+    mp = (5 * doy + 2) // 153                             # [0, 11]
+    d = doy - (153 * mp + 2) // 5 + 1                     # [1, 31]
+    m = mp + (3 if mp < 10 else -9)                       # [1, 12]
+    return (y + (1 if m <= 2 else 0), m, d)
+
+def format_http_date(epoch: int) -> str:
+    days = epoch // 86400
+    secs = epoch - days * 86400        # floor-mod, always 0..86399
+    hh = secs // 3600
+    mm = (secs % 3600) // 60
+    ss = secs % 60
+    ymd = _civil_from_days(days)
+    y = ymd[0]
+    mon = ymd[1]
+    day = ymd[2]
+    # Day of week: 1970-01-01 was a Thursday. weekday with Mon=0.
+    wd = ((days % 7) + 7) % 7          # 0 = Thursday
+    # Map epoch-day-mod-7 (Thu=0) to Mon=0 indexing: Thu is index 3.
+    dow_idx = (wd + 3) % 7
+    return (_DOW[dow_idx] + ", " + _pad2(day) + " " + _MON[mon - 1] + " " +
+            str(y) + " " + _pad2(hh) + ":" + _pad2(mm) + ":" + _pad2(ss) + " GMT")
+
+def _mon_index(s: str) -> int:
+    i = 0
+    while i < 12:
+        if _MON[i] == s:
+            return i + 1
+        i += 1
+    return -1
+
+def parse_http_date(s: str) -> int:
+    # Parse an IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT".
+    t = s.strip()
+    # Drop the weekday + comma prefix if present.
+    if "," in t:
+        idx = t.find(",")
+        t = t[idx + 1:].strip()
+    parts = t.split(" ")
+    # Expect: DD Mon YYYY HH:MM:SS GMT  (filter empties from multiple spaces)
+    fields = List[str]()
+    for p in parts:
+        if len(p) > 0:
+            fields.append(p)
+    day = int(fields[0])
+    mon = _mon_index(fields[1])
+    year = int(fields[2])
+    hms = fields[3].split(":")
+    hh = int(hms[0])
+    mm = int(hms[1])
+    ss = int(hms[2])
+    days = _days_from_civil(year, mon, day)
+    return days * 86400 + hh * 3600 + mm * 60 + ss

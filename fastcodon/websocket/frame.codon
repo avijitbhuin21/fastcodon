@@ -1,0 +1,195 @@
+# fastcodon.websocket.frame — RFC 6455 §5 frame codec (encode/decode), pure Codon.
+# Payloads are raw bytes carried in `str` (Codon str is byte-indexed). No FFI.
+from ..sys.buf import byte_at, bytes_to_str, str_to_ptr
+
+# Opcodes (RFC 6455 §5.2)
+OP_CONT  = 0x0
+OP_TEXT  = 0x1
+OP_BIN   = 0x2
+OP_CLOSE = 0x8
+OP_PING  = 0x9
+OP_PONG  = 0xA
+
+class Frame:
+    fin: bool
+    opcode: int
+    payload: str       # raw (unmasked) payload bytes
+    masked: bool        # whether the source frame carried a mask
+    mask_key: str       # 4-byte mask key (empty if unmasked)
+
+    def __init__(self, fin: bool, opcode: int, payload: str,
+                 masked: bool = False, mask_key: str = ""):
+        self.fin = fin
+        self.opcode = opcode
+        self.payload = payload
+        self.masked = masked
+        self.mask_key = mask_key
+
+def _apply_mask(payload: str, mask_key: str) -> str:
+    """XOR `payload` with the 4-byte `mask_key` (involution: masks and unmasks)."""
+    n = len(payload)
+    pp = str_to_ptr(payload)
+    out = List[byte]()
+    i = 0
+    while i < n:
+        m = byte_at(mask_key, i % 4)
+        out.append(byte(int(pp[i]) ^ m))
+        i += 1
+    return bytes_to_str(out)
+
+def encode_frame(opcode: int, payload: str, fin: bool = True,
+                 mask: bool = False, mask_key: Optional[str] = None) -> str:
+    """Encode one RFC 6455 frame to a byte str.
+
+    Server->client frames are unmasked (mask=False). Client->server frames
+    MUST be masked (mask=True) with a 4-byte mask_key (random if not given).
+    """
+    out = List[byte]()
+
+    b0 = 0
+    if fin:
+        b0 |= 0x80
+    b0 |= (opcode & 0x0f)
+    out.append(byte(b0))
+
+    n = len(payload)
+    mask_bit = 0x80 if mask else 0x00
+
+    if n <= 125:
+        out.append(byte(mask_bit | n))
+    elif n <= 0xffff:
+        out.append(byte(mask_bit | 126))
+        out.append(byte((n >> 8) & 0xff))
+        out.append(byte(n & 0xff))
+    else:
+        out.append(byte(mask_bit | 127))
+        un = u64(n)
+        j = 7
+        while j >= 0:
+            out.append(byte(int((un >> u64(8 * j)) & u64(0xff))))
+            j -= 1
+
+    body = payload
+    if mask:
+        # Determine the 4-byte mask key.
+        mk = ""
+        if mask_key is not None:
+            mk = mask_key
+        if len(mk) != 4:
+            # Deterministic fallback key derived from length (no FFI/random leaf here).
+            kb = List[byte]()
+            kb.append(byte((n + 1) & 0xff))
+            kb.append(byte((n + 2) & 0xff))
+            kb.append(byte((n + 3) & 0xff))
+            kb.append(byte((n + 4) & 0xff))
+            mk = bytes_to_str(kb)
+        for ci in range(4):
+            out.append(byte(byte_at(mk, ci)))
+        body = _apply_mask(payload, mk)
+
+    bp = str_to_ptr(body)
+    i = 0
+    while i < len(body):
+        out.append(bp[i])
+        i += 1
+
+    return bytes_to_str(out)
+
+def decode_frame(data: str) -> Optional[Tuple[Frame, int]]:
+    """Decode one frame from the front of `data`.
+
+    Returns (Frame, bytes_consumed), or None if more bytes are needed
+    (partial buffer). Unmasks the payload when the MASK bit is set.
+    """
+    n = len(data)
+    if n < 2:
+        return None
+
+    b0 = byte_at(data, 0)
+    b1 = byte_at(data, 1)
+
+    fin = (b0 & 0x80) != 0
+    opcode = b0 & 0x0f
+    masked = (b1 & 0x80) != 0
+    length = b1 & 0x7f
+
+    pos = 2
+
+    if length == 126:
+        if n < pos + 2:
+            return None
+        length = (byte_at(data, pos) << 8) | byte_at(data, pos + 1)
+        pos += 2
+    elif length == 127:
+        if n < pos + 8:
+            return None
+        ext = u64(0)
+        k = 0
+        while k < 8:
+            ext = (ext << u64(8)) | u64(byte_at(data, pos + k))
+            k += 1
+        length = int(ext)
+        pos += 8
+
+    mask_key = ""
+    if masked:
+        if n < pos + 4:
+            return None
+        kb = List[byte]()
+        kb.append(byte(byte_at(data, pos)))
+        kb.append(byte(byte_at(data, pos + 1)))
+        kb.append(byte(byte_at(data, pos + 2)))
+        kb.append(byte(byte_at(data, pos + 3)))
+        mask_key = bytes_to_str(kb)
+        pos += 4
+
+    if n < pos + length:
+        return None
+
+    # Slice raw payload bytes.
+    dp = str_to_ptr(data)
+    pb = List[byte]()
+    i = 0
+    while i < length:
+        pb.append(dp[pos + i])
+        i += 1
+    payload = bytes_to_str(pb)
+
+    if masked:
+        payload = _apply_mask(payload, mask_key)
+
+    consumed = pos + length
+    frame = Frame(fin, opcode, payload, masked, mask_key)
+    return (frame, consumed)
+
+# --- Close-frame helpers (RFC 6455 §5.5.1) -------------------------------
+
+def build_close_payload(code: int, reason: str = "") -> str:
+    """Build a close-frame payload: 2-byte big-endian status code + UTF-8 reason."""
+    out = List[byte]()
+    out.append(byte((code >> 8) & 0xff))
+    out.append(byte(code & 0xff))
+    rp = str_to_ptr(reason)
+    i = 0
+    while i < len(reason):
+        out.append(rp[i])
+        i += 1
+    return bytes_to_str(out)
+
+def parse_close_payload(payload: str) -> Tuple[int, str]:
+    """Parse a close-frame payload into (status_code, reason).
+
+    Empty payload yields (1005, "") per RFC 6455 (no status code present)."""
+    if len(payload) < 2:
+        return (1005, "")
+    code = (byte_at(payload, 0) << 8) | byte_at(payload, 1)
+    reason = ""
+    if len(payload) > 2:
+        dp = str_to_ptr(payload)
+        rb = List[byte]()
+        i = 2
+        while i < len(payload):
+            rb.append(dp[i])
+            i += 1
+        reason = bytes_to_str(rb)
+    return (code, reason)

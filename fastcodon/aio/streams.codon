@@ -1,0 +1,356 @@
+# fastcodon.aio.streams — P32: async buffered byte-streams over a non-blocking Socket.
+#
+# DESIGN (read fastcodon/reactor.codon first): the reactor is callback-based, not async/await.
+# You subclass IOHandler and override on_readable / on_writable / on_error; the Reactor delivers
+# readiness via virtual dispatch. Codon closures DO NOT unify to one callable type, so — exactly
+# like the reactor — every "callback" here is a *base-class object* with a virtual method.
+#
+# Because there is no `await`, an async operation returns a `Completion` result-holder. The caller
+# either polls `c.done` or attaches a `Continuation` object (subclass + override run(c)) that the
+# stream invokes when the operation finishes. This is the future/promise analogue that fits a
+# statically-typed, closure-less, callback reactor — NOT Codon's stdlib coroutine asyncio (which
+# has no I/O readiness and is not wired to this reactor).
+#
+# Read path:  read(n) / read_until(delim) buffer incoming bytes (filled by on_readable) and
+#             complete once enough bytes have arrived (or EOF). Backpressure on the read side is
+#             implicit: we only drain the socket into our buffer when the caller wants data; while
+#             no read is pending we keep EV_READ off so we don't spin filling an unbounded buffer.
+# Write path: write(data) appends to an outgoing buffer, turns EV_WRITE interest on, drains in
+#             on_writable, and signals completion when fully flushed. EV_WRITE interest is dropped
+#             the moment the buffer empties (backpressure: only hold write interest while pending).
+# EOF/errors: recv()==0 -> peer closed (eof). on_error -> errored; pending ops complete with their
+#             error flag set so continuations can react.
+
+from ..net.selector import EV_READ, EV_WRITE
+from ..net.socket import Socket, tcp_socket, INVALID_HANDLE
+from ..reactor import Reactor, IOHandler
+from ..sys.buf import str_to_ptr
+
+_CHUNK: Literal[int] = 65536   # max bytes pulled from the socket per readable event
+
+
+class Continuation:
+    """Base class for a completion callback. Override run(); read the operation's result off
+    these primitive fields, which Completion copies in just before calling run():
+        data    — bytes read (empty for writes)
+        nbytes  — bytes written (writes) or len(data) (reads)
+        eof     — peer closed before the op could be fully satisfied
+        errored — the op failed / was aborted (I/O error, close, cancellation)
+
+    run() takes NO argument and Continuation stores only primitives (NOT a Completion) on purpose:
+    Codon resolves class-field/param annotations EAGERLY, so a Completion<->Continuation type
+    cycle fails to compile (mirroring how the reactor's TimerCallback references nothing while
+    TimerEntry references it — the dependency is kept one-directional). Callers subclass + use
+    virtual dispatch, since Codon closures don't unify to one callable type (same idiom as the
+    reactor's IOHandler)."""
+    data: str
+    nbytes: int
+    eof: bool
+    errored: bool
+    def __init__(self):
+        self.data = ""
+        self.nbytes = 0
+        self.eof = False
+        self.errored = False
+    def run(self):
+        pass
+
+
+class Completion:
+    """A future/promise-like result holder the reactor fills. Poll `done`, or attach a
+    Continuation via then() to be called back exactly once when the op finishes."""
+    done: bool
+    errored: bool
+    eof: bool
+    data: str           # result of a read; empty for writes
+    nbytes: int         # bytes written (for writes) or len(data) (for reads)
+    cont: Optional[Continuation]
+
+    def __init__(self):
+        self.done = False
+        self.errored = False
+        self.eof = False
+        self.data = ""
+        self.nbytes = 0
+        self.cont = None
+
+    def then(self, cont: Continuation):
+        """Attach a continuation. If already done, fire it immediately (still once)."""
+        self.cont = cont
+        if self.done:
+            self._fire()
+
+    def _fire(self):
+        c = self.cont
+        if c is not None:
+            self.cont = None          # fire at most once
+            c.data = self.data        # hand the result to the continuation as primitives
+            c.nbytes = self.nbytes
+            c.eof = self.eof
+            c.errored = self.errored
+            c.run()
+
+    def _complete(self, data: str, nbytes: int, eof: bool, errored: bool):
+        if self.done:
+            return
+        self.done = True
+        self.data = data
+        self.nbytes = nbytes
+        self.eof = eof
+        self.errored = errored
+        self._fire()
+
+
+# Pending-read kinds.
+_READ_N: Literal[int] = 0          # read exactly n bytes (or until eof)
+_READ_UNTIL: Literal[int] = 1      # read until delimiter (inclusive) is found
+_READ_SOME: Literal[int] = 2       # read at least 1 byte, return whatever is available
+
+
+class Stream(IOHandler):
+    """An async byte-stream over a non-blocking Socket registered on a Reactor."""
+    r: Reactor
+    sock: Socket
+    fd: int
+
+    # read state
+    rbuf: str                       # bytes received but not yet handed to the caller
+    rpending: Optional[Completion]  # the in-flight read, if any
+    rkind: int
+    rwant: int                      # for _READ_N: target byte count
+    rdelim: str                     # for _READ_UNTIL: delimiter
+    at_eof: bool
+
+    # write state
+    wbuf: str                       # bytes queued but not yet sent
+    woff: int                       # send offset into wbuf
+    wpending: Optional[Completion]  # the in-flight write, if any
+
+    closed: bool
+
+    def __init__(self, r: Reactor, sock: Socket):
+        self.r = r
+        self.sock = sock
+        self.fd = sock.fd
+        self.rbuf = ""
+        self.rpending = None
+        self.rkind = _READ_N
+        self.rwant = 0
+        self.rdelim = ""
+        self.at_eof = False
+        self.wbuf = ""
+        self.woff = 0
+        self.wpending = None
+        self.closed = False
+        # Register with no interest; reads/writes turn interest on as needed (backpressure).
+        self.r.register(self.fd, self, 0)
+
+    # ---- public async API ----------------------------------------------------------------
+    def read(self, n: int) -> Completion:
+        """Complete once exactly `n` bytes are buffered, or EOF is hit (then returns <n)."""
+        c = Completion()
+        if self.rpending is not None:
+            c._complete("", 0, False, True)     # one read at a time
+            return c
+        self.rpending = c
+        self.rkind = _READ_N
+        self.rwant = n
+        self._try_satisfy_read()
+        if not c.done:
+            self.r.want_read(self.fd, True)
+        return c
+
+    def read_until(self, delim: str) -> Completion:
+        """Complete once `delim` appears in the stream; returns bytes up to and including it."""
+        c = Completion()
+        if self.rpending is not None:
+            c._complete("", 0, False, True)
+            return c
+        self.rpending = c
+        self.rkind = _READ_UNTIL
+        self.rdelim = delim
+        self._try_satisfy_read()
+        if not c.done:
+            self.r.want_read(self.fd, True)
+        return c
+
+    def read_some(self) -> Completion:
+        """Complete with whatever bytes are available (>=1), or EOF."""
+        c = Completion()
+        if self.rpending is not None:
+            c._complete("", 0, False, True)
+            return c
+        self.rpending = c
+        self.rkind = _READ_SOME
+        self._try_satisfy_read()
+        if not c.done:
+            self.r.want_read(self.fd, True)
+        return c
+
+    def write(self, data: str) -> Completion:
+        """Buffer `data`, drain on writability, complete when fully flushed."""
+        c = Completion()
+        if self.wpending is not None:
+            c._complete("", 0, False, True)     # one write at a time
+            return c
+        if self.closed:
+            c._complete("", 0, False, True)
+            return c
+        self.wbuf = data
+        self.woff = 0
+        self.wpending = c
+        # try an immediate drain; if anything remains, ask for write readiness.
+        self._drain_write()
+        if self.wpending is not None:
+            self.r.want_write(self.fd, True)
+        return c
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.r.unregister(self.fd)
+        self.sock.close()
+        # Fail any in-flight ops so continuations are not orphaned.
+        rp = self.rpending
+        if rp is not None:
+            self.rpending = None
+            rp._complete(self.rbuf, len(self.rbuf), True, False)
+        wp = self.wpending
+        if wp is not None:
+            self.wpending = None
+            wp._complete("", self.woff, False, True)
+
+    # ---- read internals -------------------------------------------------------------------
+    def _delim_index(self) -> int:
+        """Index just past the delimiter in rbuf, or -1 if not present. Byte-wise scan."""
+        d = self.rdelim
+        dn = len(d)
+        if dn == 0:
+            return 0
+        bn = len(self.rbuf)
+        if bn < dn:
+            return -1
+        i = 0
+        last = bn - dn
+        while i <= last:
+            j = 0
+            while j < dn and self.rbuf[i + j] == d[j]:
+                j += 1
+            if j == dn:
+                return i + dn
+            i += 1
+        return -1
+
+    def _try_satisfy_read(self):
+        """If the pending read can be served from rbuf (or eof), complete it. No socket I/O."""
+        c = self.rpending
+        if c is None:
+            return
+        k = self.rkind
+        if k == _READ_N:
+            if len(self.rbuf) >= self.rwant:
+                out = self.rbuf[:self.rwant]
+                self.rbuf = self.rbuf[self.rwant:]
+                self._finish_read(out, False)
+            elif self.at_eof:
+                out = self.rbuf
+                self.rbuf = ""
+                self._finish_read(out, True)
+        elif k == _READ_UNTIL:
+            idx = self._delim_index()
+            if idx >= 0:
+                out = self.rbuf[:idx]
+                self.rbuf = self.rbuf[idx:]
+                self._finish_read(out, False)
+            elif self.at_eof:
+                out = self.rbuf
+                self.rbuf = ""
+                self._finish_read(out, True)
+        else:  # _READ_SOME
+            if len(self.rbuf) > 0:
+                out = self.rbuf
+                self.rbuf = ""
+                self._finish_read(out, False)
+            elif self.at_eof:
+                self._finish_read("", True)
+
+    def _finish_read(self, data: str, eof: bool):
+        c = self.rpending
+        if c is None:
+            return
+        self.rpending = None
+        # no read pending now -> drop read interest (backpressure: don't fill buffer endlessly)
+        if not self.closed:
+            self.r.want_read(self.fd, False)
+        c._complete(data, len(data), eof, False)
+
+    # ---- write internals ------------------------------------------------------------------
+    def _drain_write(self):
+        """Push as much of wbuf[woff:] as the socket accepts. Completes wpending when empty."""
+        c = self.wpending
+        if c is None:
+            return
+        total = len(self.wbuf)
+        if self.woff < total:
+            chunk = self.wbuf[self.woff:]
+            p = str_to_ptr(chunk)
+            n = len(chunk)
+            sent = self.sock.send_from(p, n)
+            if sent > 0:
+                self.woff += sent
+        if self.woff >= total:
+            done_bytes = self.woff
+            self.wpending = None
+            self.wbuf = ""
+            self.woff = 0
+            if not self.closed:
+                self.r.want_write(self.fd, False)   # backpressure: drop write interest
+            c._complete("", done_bytes, False, False)
+
+    # ---- IOHandler virtual dispatch (called by the Reactor) -------------------------------
+    def on_readable(self):
+        # Pull available bytes into rbuf, then try to satisfy the pending read.
+        buf = Ptr[byte](_CHUNK)
+        while True:
+            got = self.sock.recv_into(buf, _CHUNK)
+            if got > 0:
+                self.rbuf += str(buf, got)
+                if got < _CHUNK:
+                    break          # drained for now
+            elif got == 0:
+                self.at_eof = True
+                break
+            else:
+                break              # would block (-1)
+        self._try_satisfy_read()
+
+    def on_writable(self):
+        self._drain_write()
+
+    def on_error(self):
+        rp = self.rpending
+        if rp is not None:
+            self.rpending = None
+            rp._complete("", 0, False, True)
+        wp = self.wpending
+        if wp is not None:
+            self.wpending = None
+            wp._complete("", self.woff, False, True)
+        self.close()
+
+
+# ---- factories ----------------------------------------------------------------------------
+def wrap_stream(r: Reactor, sock: Socket) -> Stream:
+    """Wrap an already-connected / accepted Socket as a Stream (sets it non-blocking)."""
+    sock.setblocking(False)
+    return Stream(r, sock)
+
+
+def connect_stream(r: Reactor, host: str, port: int) -> Stream:
+    """Open a non-blocking client connection and return a Stream. The connect may still be in
+    progress; the first write/read will complete once the socket becomes ready."""
+    s = tcp_socket()
+    s.setblocking(False)
+    s.connect(host, port)
+    return Stream(r, s)

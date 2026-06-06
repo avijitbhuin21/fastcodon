@@ -1,0 +1,220 @@
+# fastcodon.http.parser — P23: sans-I/O HTTP/1.1 request parser (h11-style state machine).
+#
+# Pure Codon, no FFI. You feed it bytes (str, byte-indexed) incrementally via feed(); it
+# accumulates and parses request-line -> headers -> body. result() returns the parsed Request
+# once complete (None until then). Body framing supports Content-Length and chunked
+# Transfer-Encoding. Header names are matched case-insensitively. Malformed input raises.
+
+CRLF = "\r\n"
+TERM = "\r\n\r\n"
+
+class Request:
+    method: str
+    target: str          # raw request-target including query string
+    http_version: str    # e.g. "1.1"
+    headers: List[Tuple[str, str]]   # original order + casing preserved
+    body: str
+
+    def __init__(self, method: str, target: str, http_version: str,
+                 headers: List[Tuple[str, str]], body: str):
+        self.method = method
+        self.target = target
+        self.http_version = http_version
+        self.headers = headers
+        self.body = body
+
+    def get(self, name: str) -> Optional[str]:
+        """Case-insensitive header lookup; returns the first match or None."""
+        key = name.lower()
+        for (k, v) in self.headers:
+            if k.lower() == key:
+                return v
+        return None
+
+
+def _parse_request_line(line: str) -> Tuple[str, str, str]:
+    # "METHOD SP request-target SP HTTP/version"
+    sp1 = line.find(" ")
+    if sp1 < 0:
+        raise ValueError("malformed request line: no method")
+    sp2 = line.find(" ", sp1 + 1)
+    if sp2 < 0:
+        raise ValueError("malformed request line: no target")
+    method = line[:sp1]
+    target = line[sp1 + 1:sp2]
+    proto = line[sp2 + 1:]
+    if method == "" or target == "":
+        raise ValueError("malformed request line: empty field")
+    if not proto.startswith("HTTP/"):
+        raise ValueError("malformed request line: bad protocol")
+    version = proto[5:]
+    if version == "":
+        raise ValueError("malformed request line: empty version")
+    return (method, target, version)
+
+
+def _parse_headers(block: str) -> List[Tuple[str, str]]:
+    # block is everything between the request line and the terminating blank line (no trailing CRLF).
+    headers = List[Tuple[str, str]]()
+    if block == "":
+        return headers
+    lines = block.split(CRLF)
+    for line in lines:
+        if line == "":
+            continue
+        colon = line.find(":")
+        if colon < 0:
+            raise ValueError("malformed header line: no colon")
+        name = line[:colon]
+        if name == "":
+            raise ValueError("malformed header line: empty name")
+        value = line[colon + 1:].strip()
+        headers.append((name, value))
+    return headers
+
+
+def _header_get(headers: List[Tuple[str, str]], name: str) -> Optional[str]:
+    key = name.lower()
+    for (k, v) in headers:
+        if k.lower() == key:
+            return v
+    return None
+
+
+def _decode_chunked(data: str) -> Tuple[bool, str, int]:
+    # Decode chunked body starting at data[0]. Returns (complete, decoded, consumed).
+    # complete=False means we need more bytes (not yet at the 0-length terminator).
+    out = List[str]()
+    pos = 0
+    n = len(data)
+    while True:
+        line_end = data.find(CRLF, pos)
+        if line_end < 0:
+            return (False, "", 0)            # incomplete size line
+        size_line = data[pos:line_end]
+        # strip optional chunk extensions after ';'
+        semi = size_line.find(";")
+        if semi >= 0:
+            size_line = size_line[:semi]
+        size_line = size_line.strip()
+        if size_line == "":
+            raise ValueError("malformed chunk: empty size")
+        size = _parse_hex(size_line)
+        data_start = line_end + 2
+        if size == 0:
+            # terminating chunk: consume trailing CRLF(s) up to the final blank line
+            end = data.find(CRLF, data_start)
+            if end < 0:
+                return (False, "", 0)        # need the final CRLF
+            consumed = end + 2
+            return (True, "".join(out), consumed)
+        data_end = data_start + size
+        if data_end + 2 > n:
+            return (False, "", 0)            # chunk body + trailing CRLF not all here yet
+        out.append(data[data_start:data_end])
+        # expect CRLF after the chunk data
+        if data[data_end:data_end + 2] != CRLF:
+            raise ValueError("malformed chunk: missing CRLF after data")
+        pos = data_end + 2
+
+
+def _parse_hex(s: str) -> int:
+    val = 0
+    for i in range(len(s)):
+        c = ord(s[i])
+        if 48 <= c <= 57:        # 0-9
+            d = c - 48
+        elif 97 <= c <= 102:     # a-f
+            d = c - 97 + 10
+        elif 65 <= c <= 70:      # A-F
+            d = c - 65 + 10
+        else:
+            raise ValueError("malformed chunk: bad hex size")
+        val = val * 16 + d
+    return val
+
+
+class RequestParser:
+    _buf: str
+    _done: bool
+    _request: Optional[Request]
+
+    def __init__(self):
+        self._buf = ""
+        self._done = False
+        self._request = None
+
+    def feed(self, data: str) -> None:
+        """Accumulate bytes and attempt to parse. Idempotent once complete."""
+        if self._done:
+            return
+        self._buf += data
+        self._try_parse()
+
+    def result(self) -> Optional[Request]:
+        """The parsed Request once complete, else None."""
+        return self._request
+
+    def parse(self, data: str) -> Optional[Request]:
+        """Convenience: feed and return result in one call."""
+        self.feed(data)
+        return self._request
+
+    def _try_parse(self) -> None:
+        buf = self._buf
+        # 1) need the full header block first (request line + headers, ended by blank line).
+        term = buf.find(TERM)
+        if term < 0:
+            return                            # headers not complete yet
+        head = buf[:term]
+        body_start = term + 4
+
+        first_crlf = head.find(CRLF)
+        if first_crlf < 0:
+            request_line = head
+            header_block = ""
+        else:
+            request_line = head[:first_crlf]
+            header_block = head[first_crlf + 2:]
+
+        (method, target, version) = _parse_request_line(request_line)
+        headers = _parse_headers(header_block)
+
+        # 2) frame the body.
+        rest = buf[body_start:]
+        te = _header_get(headers, "transfer-encoding")
+        if te is not None and te.lower().find("chunked") >= 0:
+            (complete, body, _consumed) = _decode_chunked(rest)
+            if not complete:
+                return                        # need more body bytes
+            self._finish(method, target, version, headers, body)
+            return
+
+        cl = _header_get(headers, "content-length")
+        if cl is not None:
+            length = int(cl.strip())
+            if len(rest) < length:
+                return                        # body not fully arrived
+            self._finish(method, target, version, headers, rest[:length])
+            return
+
+        # no framing headers -> empty body (request has no body)
+        self._finish(method, target, version, headers, "")
+
+    def _finish(self, method: str, target: str, version: str,
+                headers: List[Tuple[str, str]], body: str) -> None:
+        self._request = Request(method, target, version, headers, body)
+        self._done = True
+
+
+def keep_alive(req: Request) -> bool:
+    """HTTP/1.1 keep-alive default: true unless Connection: close (HTTP/1.0: needs keep-alive)."""
+    conn = req.get("connection")
+    if req.http_version == "1.0":
+        if conn is not None and conn.lower().find("keep-alive") >= 0:
+            return True
+        return False
+    # HTTP/1.1 and later default to keep-alive
+    if conn is not None and conn.lower().find("close") >= 0:
+        return False
+    return True
