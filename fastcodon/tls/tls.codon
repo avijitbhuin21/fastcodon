@@ -13,6 +13,7 @@
 
 from ..net.socket import Socket
 from ..sys.config import IS_WINDOWS
+from ..sys.buf import str_to_ptr
 
 # ---- OpenSSL FFI (identical symbol names on all platforms) -------------------------------
 from C import OPENSSL_init_ssl(u64, cobj) -> i32 as _ossl_init
@@ -139,7 +140,7 @@ class TLSConn:
         return ""
 
     def write(self, data: str) -> int:
-        status, n = self.write_from(data._ptr, len(data))
+        status, n = self.write_from(str_to_ptr(data), len(data))
         return n if status == TLS_OK else 0
 
     def shutdown(self):

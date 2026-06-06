@@ -1,4 +1,5 @@
 # fastcodon.crypto.sha256 — FIPS 180-4 SHA-256. Returns a 32-byte raw digest (as a byte str).
+from ..sys.buf import str_to_ptr
 
 _K = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -18,9 +19,10 @@ def sha256(data: str) -> str:
     # --- padding ---
     msg = List[byte]()
     n = len(data)
+    dp = str_to_ptr(data)
     i = 0
     while i < n:
-        msg.append(data._ptr[i]); i += 1
+        msg.append(dp[i]); i += 1
     bitlen = n * 8
     msg.append(byte(0x80))
     while len(msg) % 64 != 56:
@@ -75,14 +77,16 @@ def sha256(data: str) -> str:
         k += 1
     return str(out, 32)
 
+_HEXD = str_to_ptr("0123456789abcdef")
+
 def _hex(raw: str) -> str:
-    digits = "0123456789abcdef"
+    rp = str_to_ptr(raw)
     out = Ptr[byte](len(raw) * 2)
     i = 0
     while i < len(raw):
-        b = int(raw._ptr[i])
-        out[i * 2] = digits._ptr[(b >> 4) & 0xf]
-        out[i * 2 + 1] = digits._ptr[b & 0xf]
+        b = int(rp[i])
+        out[i * 2] = _HEXD[(b >> 4) & 0xf]
+        out[i * 2 + 1] = _HEXD[b & 0xf]
         i += 1
     return str(out, len(raw) * 2)
 

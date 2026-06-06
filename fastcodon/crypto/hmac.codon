@@ -1,13 +1,15 @@
 # fastcodon.crypto.hmac — RFC 2104 HMAC-SHA256 (JWT / OAuth2 signing).
 from .sha256 import sha256
+from ..sys.buf import str_to_ptr, bytes_to_str
 
 _BLOCK: Literal[int] = 64   # SHA-256 block size in bytes
 
 def _bytes(s: str) -> List[byte]:
     out = List[byte]()
+    sp = str_to_ptr(s)
     i = 0
     while i < len(s):
-        out.append(s._ptr[i]); i += 1
+        out.append(sp[i]); i += 1
     return out
 
 def hmac_sha256(key: str, msg: str) -> str:
@@ -26,23 +28,27 @@ def hmac_sha256(key: str, msg: str) -> str:
         outer.append(byte(kb ^ 0x5c))
         i += 1
     # inner = ipad || msg ; then opad || sha256(inner)
+    mp = str_to_ptr(msg)
     i = 0
     while i < len(msg):
-        inner.append(msg._ptr[i]); i += 1
-    inner_digest = sha256(str(inner._ptr, len(inner)))
+        inner.append(mp[i]); i += 1
+    inner_digest = sha256(bytes_to_str(inner))
+    idp = str_to_ptr(inner_digest)
     i = 0
     while i < len(inner_digest):
-        outer.append(inner_digest._ptr[i]); i += 1
-    return sha256(str(outer._ptr, len(outer)))
+        outer.append(idp[i]); i += 1
+    return sha256(bytes_to_str(outer))
 
 def hmac_sha256_hex(key: str, msg: str) -> str:
-    digits = "0123456789abcdef"
+    digits = str_to_ptr("0123456789abcdef")
     raw = hmac_sha256(key, msg)
-    out = Ptr[byte](len(raw) * 2)
+    rp = str_to_ptr(raw)
+    raw_len = len(raw)
+    out = Ptr[byte](raw_len * 2)
     i = 0
-    while i < len(raw):
-        b = int(raw._ptr[i])
-        out[i * 2] = digits._ptr[(b >> 4) & 0xf]
-        out[i * 2 + 1] = digits._ptr[b & 0xf]
+    while i < raw_len:
+        b = int(rp[i])
+        out[i * 2] = digits[(b >> 4) & 0xf]
+        out[i * 2 + 1] = digits[b & 0xf]
         i += 1
-    return str(out, len(raw) * 2)
+    return str(out, raw_len * 2)

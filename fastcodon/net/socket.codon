@@ -8,6 +8,7 @@
 
 from ..sys.config import IS_WINDOWS, IS_APPLE, IS_LINUX
 from ..sys.oserror import last_error, would_block, OSCallError, EINPROGRESS
+from ..sys.buf import str_to_ptr
 
 # FFI is declared at top level with DISTINCT per-platform aliases (`_w_*` Windows / `_p_*`
 # POSIX). Each alias is only *called* inside the matching compile-time branch, so the other
@@ -63,7 +64,7 @@ SHUT_RDWR: Literal[int] = 2
 FIONBIO: Literal[int] = 0x8004667E
 F_GETFL: Literal[int] = 3
 F_SETFL: Literal[int] = 4
-O_NONBLOCK: Literal[int] = (4 if IS_APPLE else 0o4000)
+O_NONBLOCK: Literal[int] = (4 if IS_APPLE else 2048)   # macOS 0x0004, Linux 0o4000 == 2048
 
 INVALID_HANDLE: Literal[int] = -1
 
@@ -236,10 +237,11 @@ class Socket:
 
     def send(self, data: str) -> int:
         """Send all of `data`; returns bytes sent."""
-        total = 0
         n = len(data)
+        buf = str_to_ptr(data)
+        total = 0
         while total < n:
-            s = self.send_from(data._ptr + total, n - total)
+            s = self.send_from(buf + total, n - total)
             if s < 0:
                 continue  # would-block on a blocking socket shouldn't happen; spin
             total += s

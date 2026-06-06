@@ -1,5 +1,6 @@
 # fastcodon.crypto.sha1 — RFC 3174 SHA-1. Returns a 20-byte raw digest (as a byte str).
 # Used for the WebSocket `Sec-WebSocket-Accept` handshake (SHA-1 + base64). Not for security.
+from ..sys.buf import str_to_ptr
 
 def _rotl(x: u32, n: int) -> u32:
     return (x << u32(n)) | (x >> u32(32 - n))
@@ -7,9 +8,10 @@ def _rotl(x: u32, n: int) -> u32:
 def sha1(data: str) -> str:
     msg = List[byte]()
     n = len(data)
+    dp = str_to_ptr(data)
     i = 0
     while i < n:
-        msg.append(data._ptr[i]); i += 1
+        msg.append(dp[i]); i += 1
     bitlen = n * 8
     msg.append(byte(0x80))
     while len(msg) % 64 != 56:
@@ -67,13 +69,13 @@ def sha1(data: str) -> str:
     return str(out, 20)
 
 def sha1_hex(data: str) -> str:
-    digits = "0123456789abcdef"
-    raw = sha1(data)
+    digits = str_to_ptr("0123456789abcdef")
+    rp = str_to_ptr(sha1(data))
     out = Ptr[byte](40)
     i = 0
     while i < 20:
-        b = int(raw._ptr[i])
-        out[i * 2] = digits._ptr[(b >> 4) & 0xf]
-        out[i * 2 + 1] = digits._ptr[b & 0xf]
+        b = int(rp[i])
+        out[i * 2] = digits[(b >> 4) & 0xf]
+        out[i * 2 + 1] = digits[b & 0xf]
         i += 1
     return str(out, 40)

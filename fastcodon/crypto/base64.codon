@@ -1,35 +1,40 @@
 # fastcodon.crypto.base64 — RFC 4648 base64 (standard + url-safe).
+from ..sys.buf import str_to_ptr, bytes_to_str
 
 _STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 _URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+# Alphabets as byte pointers (built once) so encoding is a plain index, no str field access.
+_STD_P = str_to_ptr(_STD)
+_URL_P = str_to_ptr(_URL)
 
 def b64encode(data: str, urlsafe: bool = False, pad: bool = True) -> str:
-    alpha = _URL if urlsafe else _STD
+    alpha = _URL_P if urlsafe else _STD_P
     n = len(data)
+    dp = str_to_ptr(data)
     out = List[byte]()
     i = 0
     while i + 3 <= n:
-        b0 = int(data._ptr[i]); b1 = int(data._ptr[i + 1]); b2 = int(data._ptr[i + 2])
-        out.append(alpha._ptr[b0 >> 2])
-        out.append(alpha._ptr[((b0 & 0x3) << 4) | (b1 >> 4)])
-        out.append(alpha._ptr[((b1 & 0xf) << 2) | (b2 >> 6)])
-        out.append(alpha._ptr[b2 & 0x3f])
+        b0 = int(dp[i]); b1 = int(dp[i + 1]); b2 = int(dp[i + 2])
+        out.append(alpha[b0 >> 2])
+        out.append(alpha[((b0 & 0x3) << 4) | (b1 >> 4)])
+        out.append(alpha[((b1 & 0xf) << 2) | (b2 >> 6)])
+        out.append(alpha[b2 & 0x3f])
         i += 3
     rem = n - i
     if rem == 1:
-        b0 = int(data._ptr[i])
-        out.append(alpha._ptr[b0 >> 2])
-        out.append(alpha._ptr[(b0 & 0x3) << 4])
+        b0 = int(dp[i])
+        out.append(alpha[b0 >> 2])
+        out.append(alpha[(b0 & 0x3) << 4])
         if pad:
             out.append(byte(61)); out.append(byte(61))   # '=='
     elif rem == 2:
-        b0 = int(data._ptr[i]); b1 = int(data._ptr[i + 1])
-        out.append(alpha._ptr[b0 >> 2])
-        out.append(alpha._ptr[((b0 & 0x3) << 4) | (b1 >> 4)])
-        out.append(alpha._ptr[(b1 & 0xf) << 2])
+        b0 = int(dp[i]); b1 = int(dp[i + 1])
+        out.append(alpha[b0 >> 2])
+        out.append(alpha[((b0 & 0x3) << 4) | (b1 >> 4)])
+        out.append(alpha[(b1 & 0xf) << 2])
         if pad:
             out.append(byte(61))                          # '='
-    return str(out._ptr, len(out))
+    return bytes_to_str(out)
 
 def _rev(c: int) -> int:
     # decode one base64 char (accepts both standard and url-safe alphabets); -1 if invalid
@@ -51,8 +56,9 @@ def b64decode(s: str) -> str:
     q = 0
     i = 0
     n = len(s)
+    sp = str_to_ptr(s)
     while i < n:
-        c = int(s._ptr[i]); i += 1
+        c = int(sp[i]); i += 1
         if c == 61:        # '=' padding -> stop collecting
             break
         v = _rev(c)
@@ -69,4 +75,4 @@ def b64decode(s: str) -> str:
     elif q == 3:
         out.append(byte(((quad[0] << 2) | (quad[1] >> 4)) & 0xff))
         out.append(byte(((quad[1] << 4) | (quad[2] >> 2)) & 0xff))
-    return str(out._ptr, len(out))
+    return bytes_to_str(out)

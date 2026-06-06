@@ -1,0 +1,31 @@
+# fastcodon.sys.buf — portable byte access for `str`.
+#
+# Codon stdlib variants disagree on the raw pointer field name (upstream `str.ptr`/`.len`; some
+# builds expose `_ptr`/`_len`). To stay portable across every toolchain we touch a `str`'s bytes
+# ONLY through the public API: `len()` and `ord(s[i])` (Codon's `str` is byte-indexed, so `s[i]`
+# is the i-th byte and `ord` yields 0..255). Output is always built into our own `Ptr[byte]` and
+# wrapped with the stable `str(ptr, len)` constructor.
+
+def byte_at(s: str, i: int) -> int:
+    """The i-th byte of `s` (0..255), portably."""
+    return ord(s[i])
+
+def str_to_ptr(s: str) -> Ptr[byte]:
+    """Copy `s`'s bytes into a fresh Ptr[byte] (length len(s))."""
+    n = len(s)
+    p = Ptr[byte](n)
+    i = 0
+    while i < n:
+        p[i] = byte(ord(s[i]))
+        i += 1
+    return p
+
+def bytes_to_str(b: List[byte]) -> str:
+    """Build a `str` from a List[byte] using only the stable str(ptr, len) constructor."""
+    n = len(b)
+    p = Ptr[byte](n)
+    i = 0
+    while i < n:
+        p[i] = b[i]
+        i += 1
+    return str(p, n)
