@@ -126,6 +126,7 @@ class Stream(IOHandler):
     woff: int                       # send offset into wbuf
     wpending: Optional[Completion]  # the in-flight write, if any
 
+    connecting: bool                # non-blocking connect in progress (no send until writable)
     closed: bool
 
     def __init__(self, r: Reactor, sock: Socket):
@@ -141,9 +142,16 @@ class Stream(IOHandler):
         self.wbuf = ""
         self.woff = 0
         self.wpending = None
+        self.connecting = False
         self.closed = False
         # Register with no interest; reads/writes turn interest on as needed (backpressure).
         self.r.register(self.fd, self, 0)
+
+    def _begin_connect(self):
+        """Mark a non-blocking connect as in progress and ask the reactor to report when the
+        socket becomes writable (= connect completed or failed). No send happens until then."""
+        self.connecting = True
+        self.r.want_write(self.fd, True)
 
     # ---- public async API ----------------------------------------------------------------
     def read(self, n: int) -> Completion:
@@ -288,6 +296,8 @@ class Stream(IOHandler):
     # ---- write internals ------------------------------------------------------------------
     def _drain_write(self):
         """Push as much of wbuf[woff:] as the socket accepts. Completes wpending when empty."""
+        if self.connecting:
+            return                  # connect still in progress -> sending now would ENOTCONN
         c = self.wpending
         if c is None:
             return
@@ -326,6 +336,16 @@ class Stream(IOHandler):
         self._try_satisfy_read()
 
     def on_writable(self):
+        if self.connecting:
+            # The non-blocking connect has resolved. SO_ERROR tells us success (0) or failure.
+            err = self.sock.so_error()
+            self.connecting = False
+            if err != 0:
+                self.on_error()         # connect failed -> fail pending ops + close
+                return
+            if self.wpending is None and not self.closed:
+                self.r.want_write(self.fd, False)   # connected, nothing to send yet
+                return
         self._drain_write()
 
     def on_error(self):
@@ -348,9 +368,14 @@ def wrap_stream(r: Reactor, sock: Socket) -> Stream:
 
 
 def connect_stream(r: Reactor, host: str, port: int) -> Stream:
-    """Open a non-blocking client connection and return a Stream. The connect may still be in
-    progress; the first write/read will complete once the socket becomes ready."""
+    """Open a non-blocking client connection and return a Stream. The connect usually completes
+    asynchronously; the Stream defers all sends until the socket reports writable (connect done),
+    so a write issued immediately is buffered, not pushed onto an unconnected socket (which would
+    raise ENOTCONN on macOS)."""
     s = tcp_socket()
     s.setblocking(False)
-    s.connect(host, port)
-    return Stream(r, s)
+    established = s.connect(host, port)
+    stream = Stream(r, s)
+    if not established:
+        stream._begin_connect()
+    return stream

@@ -24,6 +24,7 @@ from C import connect(u64, cobj, i32) -> i32 as _w_connect
 from C import send(u64, cobj, i32, i32) -> i32 as _w_send
 from C import recv(u64, cobj, i32, i32) -> i32 as _w_recv
 from C import setsockopt(u64, i32, i32, cobj, i32) -> i32 as _w_setsockopt
+from C import getsockopt(u64, i32, i32, cobj, Ptr[i32]) -> i32 as _w_getsockopt
 from C import shutdown(u64, i32) -> i32 as _w_shutdown
 from C import closesocket(u64) -> i32 as _w_close
 from C import ioctlsocket(u64, i32, Ptr[u32]) -> i32 as _w_ioctlsocket
@@ -36,6 +37,7 @@ from C import connect(i32, cobj, u32) -> i32 as _p_connect
 from C import send(i32, cobj, int, i32) -> int as _p_send
 from C import recv(i32, cobj, int, i32) -> int as _p_recv
 from C import setsockopt(i32, i32, i32, cobj, u32) -> i32 as _p_setsockopt
+from C import getsockopt(i32, i32, i32, cobj, Ptr[u32]) -> i32 as _p_getsockopt
 from C import shutdown(i32, i32) -> i32 as _p_shutdown
 from C import close(i32) -> i32 as _p_close
 # fcntl is variadic: `int fcntl(int, int, ...)`. It MUST be declared variadic (`...`), not as a
@@ -57,6 +59,7 @@ IPPROTO_UDP: Literal[int] = 17
 
 SOL_SOCKET: Literal[int] = (0xffff if (IS_WINDOWS or IS_APPLE) else 1)
 SO_REUSEADDR: Literal[int] = (4 if (IS_WINDOWS or IS_APPLE) else 2)
+SO_ERROR: Literal[int] = (0x1007 if (IS_WINDOWS or IS_APPLE) else 4)
 SO_KEEPALIVE: Literal[int] = (8 if (IS_WINDOWS or IS_APPLE) else 9)
 SO_REUSEPORT: Literal[int] = (0x0200 if IS_APPLE else (15 if IS_LINUX else 0))
 TCP_NODELAY: Literal[int] = 1
@@ -156,6 +159,25 @@ class Socket:
                                    buf.as_byte(), u32(4)))
         if rc != 0:
             self._err("setsockopt")
+
+    def so_error(self) -> int:
+        """Pending socket error via getsockopt(SO_ERROR), and clears it. 0 = no error. Used to
+        check the result of a non-blocking connect once the socket reports writable."""
+        buf = Ptr[i32](1)
+        buf[0] = i32(0)
+        if IS_WINDOWS:
+            ln = Ptr[i32](1)
+            ln[0] = i32(4)
+            rc = int(_w_getsockopt(u64(self.fd), i32(SOL_SOCKET), i32(SO_ERROR),
+                                   buf.as_byte(), ln))
+        else:
+            ln = Ptr[u32](1)
+            ln[0] = u32(4)
+            rc = int(_p_getsockopt(i32(self.fd), i32(SOL_SOCKET), i32(SO_ERROR),
+                                   buf.as_byte(), ln))
+        if rc != 0:
+            self._err("getsockopt(SO_ERROR)")
+        return int(buf[0])
 
     def set_reuseaddr(self, on: bool = True):
         self._setsockopt_int(SOL_SOCKET, SO_REUSEADDR, 1 if on else 0)
