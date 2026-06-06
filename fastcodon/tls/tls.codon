@@ -1,0 +1,184 @@
+# fastcodon.tls.tls — P14: a thin, non-blocking-aware OpenSSL 3.x wrapper.
+#
+# Strategy = BORROW (roadmap §0.5): never hand-roll TLS. The same libssl/libcrypto symbols exist
+# on every platform, so the FFI is platform-uniform; only the LINK differs:
+#   POSIX  : -lssl -lcrypto                (system OpenSSL; matches the platform CRT, links clean)
+#   Windows: -l libssl.lib -l libcrypto.lib -l ws2_32 -l advapi32 -l crypt32 -l user32 -l bcrypt
+#            (must use an OpenSSL built against the SAME CRT flavor as Codon — a static-CRT
+#             OpenSSL, or wire Codon's link to the dynamic UCRT import libs. See scripts/dev.ps1.)
+#
+# Non-blocking model: handshake/read/write return a TLS_* status. On TLS_WANT_READ / TLS_WANT_WRITE
+# the caller (the reactor, P31) waits for that readiness on the underlying fd and retries — so TLS
+# composes with the event loop exactly like a plain socket.
+
+from ..net.socket import Socket
+from ..sys.config import IS_WINDOWS
+
+# ---- OpenSSL FFI (identical symbol names on all platforms) -------------------------------
+from C import OPENSSL_init_ssl(u64, cobj) -> i32 as _ossl_init
+from C import OpenSSL_version(i32) -> cobj as _ossl_version
+from C import TLS_client_method() -> cobj as _tls_client_method
+from C import TLS_server_method() -> cobj as _tls_server_method
+from C import SSL_CTX_new(cobj) -> cobj as _ctx_new
+from C import SSL_CTX_free(cobj) -> None as _ctx_free
+from C import SSL_CTX_use_certificate_file(cobj, cobj, i32) -> i32 as _ctx_cert_file
+from C import SSL_CTX_use_PrivateKey_file(cobj, cobj, i32) -> i32 as _ctx_key_file
+from C import SSL_CTX_set_verify(cobj, i32, cobj) -> None as _ctx_set_verify
+from C import SSL_new(cobj) -> cobj as _ssl_new
+from C import SSL_free(cobj) -> None as _ssl_free
+from C import SSL_set_fd(cobj, i32) -> i32 as _ssl_set_fd
+from C import SSL_set_connect_state(cobj) -> None as _ssl_set_connect_state
+from C import SSL_set_accept_state(cobj) -> None as _ssl_set_accept_state
+from C import SSL_do_handshake(cobj) -> i32 as _ssl_do_handshake
+from C import SSL_read(cobj, cobj, i32) -> i32 as _ssl_read
+from C import SSL_write(cobj, cobj, i32) -> i32 as _ssl_write
+from C import SSL_get_error(cobj, i32) -> i32 as _ssl_get_error
+from C import SSL_shutdown(cobj) -> i32 as _ssl_shutdown
+from C import SSL_ctrl(cobj, i32, int, cobj) -> int as _ssl_ctrl
+
+# OpenSSL constants
+_SSL_FILETYPE_PEM: Literal[int] = 1
+_SSL_VERIFY_NONE: Literal[int] = 0
+_SSL_VERIFY_PEER: Literal[int] = 1
+_SSL_CTRL_SET_TLSEXT_HOSTNAME: Literal[int] = 55
+_TLSEXT_NAMETYPE_host_name: Literal[int] = 0
+
+_SSL_ERROR_NONE: Literal[int] = 0
+_SSL_ERROR_SSL: Literal[int] = 1
+_SSL_ERROR_WANT_READ: Literal[int] = 2
+_SSL_ERROR_WANT_WRITE: Literal[int] = 3
+_SSL_ERROR_SYSCALL: Literal[int] = 5
+_SSL_ERROR_ZERO_RETURN: Literal[int] = 6
+
+# Public status codes returned by handshake/read/write
+TLS_OK: Literal[int] = 0
+TLS_WANT_READ: Literal[int] = 1
+TLS_WANT_WRITE: Literal[int] = 2
+TLS_CLOSED: Literal[int] = 3
+TLS_ERROR: Literal[int] = 4
+
+_initialized = False
+
+def _ensure_init():
+    global _initialized
+    if not _initialized:
+        _ossl_init(u64(0), cobj())   # OPENSSL_INIT defaults: load ciphers + error strings
+        _initialized = True
+
+def openssl_version() -> str:
+    _ensure_init()
+    return str.from_ptr(_ossl_version(i32(0)))
+
+
+class TLSError(Exception):
+    def __init__(self, msg: str):
+        super().__init__(msg)
+
+
+class TLSConn:
+    """One TLS session bound to a non-blocking Socket. Drive handshake()/read()/write() and
+    react to TLS_WANT_READ / TLS_WANT_WRITE by waiting on the fd, just like a raw socket.
+    Construct via TLSContext.wrap(); takes the raw SSL_CTX pointer to avoid a class cycle."""
+    ssl: cobj
+    sock: Socket
+    server: bool
+
+    def __init__(self, ctx_ptr: cobj, sock: Socket, server: bool, server_hostname: str):
+        s = _ssl_new(ctx_ptr)
+        if s == cobj():
+            raise TLSError("SSL_new failed")
+        # SSL_set_fd takes an int; on Windows our SOCKET handle is wide but fits typical fds.
+        _ssl_set_fd(s, i32(sock.fd))
+        if server:
+            _ssl_set_accept_state(s)
+        else:
+            _ssl_set_connect_state(s)
+            if server_hostname != "":
+                # SNI: SSL_set_tlsext_host_name(ssl, host)
+                _ssl_ctrl(s, i32(_SSL_CTRL_SET_TLSEXT_HOSTNAME),
+                          _TLSEXT_NAMETYPE_host_name, server_hostname.c_str())
+        self.ssl = s
+        self.sock = sock
+        self.server = server
+
+    def _status(self, ret: int) -> int:
+        if ret > 0:
+            return TLS_OK
+        err = int(_ssl_get_error(self.ssl, i32(ret)))
+        if err == _SSL_ERROR_WANT_READ:
+            return TLS_WANT_READ
+        if err == _SSL_ERROR_WANT_WRITE:
+            return TLS_WANT_WRITE
+        if err == _SSL_ERROR_ZERO_RETURN:
+            return TLS_CLOSED
+        return TLS_ERROR
+
+    def handshake(self) -> int:
+        """Advance the TLS handshake. Returns TLS_OK when complete, or TLS_WANT_* to retry."""
+        return self._status(int(_ssl_do_handshake(self.ssl)))
+
+    def read_into(self, buf: Ptr[byte], n: int) -> Tuple[int, int]:
+        """Returns (status, nbytes). On TLS_OK, nbytes is the count read (>0)."""
+        r = int(_ssl_read(self.ssl, buf.as_byte(), i32(n)))
+        if r > 0:
+            return (TLS_OK, r)
+        return (self._status(r), 0)
+
+    def write_from(self, buf: Ptr[byte], n: int) -> Tuple[int, int]:
+        """Returns (status, nbytes). On TLS_OK, nbytes is the count written (>0)."""
+        r = int(_ssl_write(self.ssl, buf.as_byte(), i32(n)))
+        if r > 0:
+            return (TLS_OK, r)
+        return (self._status(r), 0)
+
+    def read(self, n: int) -> str:
+        buf = Ptr[byte](n)
+        status, got = self.read_into(buf, n)
+        if status == TLS_OK and got > 0:
+            return str(buf, got)
+        return ""
+
+    def write(self, data: str) -> int:
+        status, n = self.write_from(data._ptr, len(data))
+        return n if status == TLS_OK else 0
+
+    def shutdown(self):
+        if self.ssl != cobj():
+            _ssl_shutdown(self.ssl)
+
+    def close(self):
+        if self.ssl != cobj():
+            _ssl_free(self.ssl)
+            self.ssl = cobj()
+
+
+class TLSContext:
+    """An SSL_CTX — share one across many connections of the same role (client or server)."""
+    ctx: cobj
+    is_server: bool
+
+    def __init__(self, server: bool = False):
+        _ensure_init()
+        method = _tls_server_method() if server else _tls_client_method()
+        c = _ctx_new(method)
+        if c == cobj():
+            raise TLSError("SSL_CTX_new failed")
+        self.ctx = c
+        self.is_server = server
+
+    def load_cert_chain(self, certfile: str, keyfile: str):
+        if int(_ctx_cert_file(self.ctx, certfile.c_str(), i32(_SSL_FILETYPE_PEM))) != 1:
+            raise TLSError("failed to load certificate: " + certfile)
+        if int(_ctx_key_file(self.ctx, keyfile.c_str(), i32(_SSL_FILETYPE_PEM))) != 1:
+            raise TLSError("failed to load private key: " + keyfile)
+
+    def set_verify(self, verify: bool):
+        _ctx_set_verify(self.ctx, i32(_SSL_VERIFY_PEER if verify else _SSL_VERIFY_NONE), cobj())
+
+    def wrap(self, sock: Socket, server: bool = False, server_hostname: str = "") -> TLSConn:
+        return TLSConn(self.ctx, sock, server, server_hostname)
+
+    def close(self):
+        if self.ctx != cobj():
+            _ctx_free(self.ctx)
+            self.ctx = cobj()

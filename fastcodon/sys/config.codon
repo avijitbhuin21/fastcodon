@@ -1,0 +1,29 @@
+# fastcodon.sys.config — compile-time platform selector.
+#
+# GENERATED / EDIT-PER-PLATFORM. The values below pick the OS at COMPILE TIME so that
+# `if IS_WINDOWS:` / `if IS_APPLE:` branches statically elide the other platforms' C FFI
+# imports (a hardcoded `Literal[int]` is required for this elision — a runtime value will
+# NOT elide and will cause "Symbols not found" at JIT/link time).
+#
+# Codon's own `__windows__` / `__apple__` defines are only visible inside the stdlib
+# `internal` namespace, so user code cannot use them — hence this generated file. The
+# `scripts/setup.{ps1,sh}` helpers rewrite the two literals below to match the host OS.
+#
+#   Windows : IS_WINDOWS = 1, IS_APPLE = 0
+#   macOS   : IS_WINDOWS = 0, IS_APPLE = 1
+#   Linux   : IS_WINDOWS = 0, IS_APPLE = 0   (any distro / arch)
+
+IS_WINDOWS: Literal[int] = 1
+IS_APPLE: Literal[int] = 0
+
+# Linux is "neither" — kept as a derived static for readability.
+IS_LINUX: Literal[int] = 0 if (IS_WINDOWS or IS_APPLE) else 1
+
+
+def platform_name() -> str:
+    if IS_WINDOWS:
+        return "windows"
+    elif IS_APPLE:
+        return "darwin"
+    else:
+        return "linux"

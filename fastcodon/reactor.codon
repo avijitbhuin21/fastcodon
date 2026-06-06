@@ -1,0 +1,159 @@
+# fastcodon.reactor — P31: the async I/O reactor.
+#
+# Fuses the cross-platform Selector (P12) with non-blocking Sockets (P11) and a timer queue into
+# one event loop. Codon closures don't unify to a single callable type, so — like Python asyncio's
+# transports/protocols — readiness is delivered to *handler objects* via virtual dispatch:
+# subclass `IOHandler` and override on_readable / on_writable / on_error. The loop selects with a
+# timeout bounded by the next timer, dispatches ready fds, then fires due timers.
+#
+# This is the callback layer; an async/await coroutine layer (P33) can build on top of it.
+
+from time import monotonic
+from .net.selector import Selector, EV_READ, EV_WRITE
+
+
+class IOHandler:
+    """Base class for objects that react to I/O readiness on a registered fd. Override these."""
+    def on_readable(self):
+        pass
+    def on_writable(self):
+        pass
+    def on_error(self):
+        pass
+
+
+class TimerCallback:
+    """Base class for a deferred call. Override run()."""
+    def run(self):
+        pass
+
+
+class TimerEntry:
+    when: float
+    cb: TimerCallback
+    cancelled: bool
+
+    def __init__(self, when: float, cb: TimerCallback):
+        self.when = when
+        self.cb = cb
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class Reactor:
+    sel: Selector
+    handlers: Dict[int, IOHandler]
+    interests: Dict[int, int]
+    timers: List[TimerEntry]
+    running: bool
+
+    def __init__(self):
+        self.sel = Selector()
+        self.handlers = {}
+        self.interests = {}
+        self.timers = []
+        self.running = False
+
+    # ---- registration ----
+    def register(self, fd: int, handler: IOHandler, events: int):
+        self.handlers[fd] = handler
+        self.interests[fd] = events
+        self.sel.register(fd, events, token=fd)
+
+    def set_interest(self, fd: int, events: int):
+        if self.interests.get(fd, -1) == events:
+            return
+        self.interests[fd] = events
+        self.sel.modify(fd, events)
+
+    def want_read(self, fd: int, on: bool = True):
+        cur = self.interests.get(fd, 0)
+        self.set_interest(fd, (cur | EV_READ) if on else (cur & ~EV_READ))
+
+    def want_write(self, fd: int, on: bool = True):
+        cur = self.interests.get(fd, 0)
+        self.set_interest(fd, (cur | EV_WRITE) if on else (cur & ~EV_WRITE))
+
+    def unregister(self, fd: int):
+        if fd in self.handlers:
+            del self.handlers[fd]
+        if fd in self.interests:
+            del self.interests[fd]
+        self.sel.unregister(fd)
+
+    # ---- timers ----
+    def call_at(self, when: float, cb: TimerCallback) -> TimerEntry:
+        e = TimerEntry(when, cb)
+        self.timers.append(e)
+        return e
+
+    def call_later(self, delay: float, cb: TimerCallback) -> TimerEntry:
+        return self.call_at(monotonic() + delay, cb)
+
+    def call_soon(self, cb: TimerCallback) -> TimerEntry:
+        return self.call_at(0.0, cb)
+
+    def _next_timeout_ms(self) -> int:
+        if not self.timers:
+            return -1                       # nothing scheduled -> block until I/O
+        now = monotonic()
+        best = -1.0
+        for e in self.timers:
+            if e.cancelled:
+                continue
+            if best < 0.0 or e.when < best:
+                best = e.when
+        if best < 0.0:
+            return -1
+        ms = int((best - now) * 1000.0)
+        return 0 if ms < 0 else ms
+
+    def _run_due_timers(self):
+        if not self.timers:
+            return
+        now = monotonic()
+        due = List[TimerEntry]()
+        keep = List[TimerEntry]()
+        for e in self.timers:
+            if e.cancelled:
+                continue
+            if e.when <= now:
+                due.append(e)
+            else:
+                keep.append(e)
+        self.timers = keep
+        for e in due:
+            e.cb.run()
+
+    # ---- driving ----
+    def stop(self):
+        self.running = False
+
+    def _has_work(self) -> bool:
+        return len(self.handlers) > 0 or len(self.timers) > 0
+
+    def run_forever(self):
+        self.running = True
+        while self.running and self._has_work():
+            timeout = self._next_timeout_ms()
+            events = self.sel.select(timeout)
+            for ev in events:
+                if ev.fd not in self.handlers:
+                    continue
+                h = self.handlers[ev.fd]
+                if ev.errored:
+                    h.on_error()
+                    continue
+                if ev.readable and ev.fd in self.handlers:
+                    self.handlers[ev.fd].on_readable()
+                if ev.writable and ev.fd in self.handlers:
+                    self.handlers[ev.fd].on_writable()
+            self._run_due_timers()
+
+    def close(self):
+        self.handlers = {}
+        self.interests = {}
+        self.timers = []
+        self.sel.close()

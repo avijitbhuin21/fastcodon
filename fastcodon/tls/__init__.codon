@@ -1,0 +1,3 @@
+# fastcodon.tls — P14: TLS via OpenSSL (libssl/libcrypto) over our non-blocking sockets.
+from .tls import (TLSContext, TLSConn, TLS_OK, TLS_WANT_READ, TLS_WANT_WRITE,
+                  TLS_CLOSED, TLS_ERROR, openssl_version)

@@ -1,0 +1,286 @@
+# fastcodon.net.socket — P11: cross-platform TCP sockets (Windows / macOS / Linux).
+#
+# The same C symbol names (`socket`, `bind`, `recv`, ...) resolve via libc on POSIX and via
+# ws2_32 on Windows (link with `-l ws2_32`). Only the SIGNATURES differ: a Windows SOCKET is a
+# 64-bit handle (u64) while a POSIX fd is a 32-bit int, and the length/addrlen integer widths
+# differ. We import a platform-correct set under shared aliases inside a compile-time `if`, then
+# expose one uniform `Socket` API. The unused platform's imports are statically elided.
+
+from ..sys.config import IS_WINDOWS, IS_APPLE, IS_LINUX
+from ..sys.oserror import last_error, would_block, OSCallError, EINPROGRESS
+
+# FFI is declared at top level with DISTINCT per-platform aliases (`_w_*` Windows / `_p_*`
+# POSIX). Each alias is only *called* inside the matching compile-time branch, so the other
+# platform's variant is statically elided (never materialized -> no link error). This is more
+# reliable than conditional `from C import` inside a static `if` (whose scoping proved flaky).
+# Windows / ws2_32 (SOCKET = u64):
+from C import WSAStartup(u16, cobj) -> i32 as _w_wsastartup
+from C import socket(i32, i32, i32) -> u64 as _w_socket
+from C import bind(u64, cobj, i32) -> i32 as _w_bind
+from C import listen(u64, i32) -> i32 as _w_listen
+from C import accept(u64, cobj, cobj) -> u64 as _w_accept
+from C import connect(u64, cobj, i32) -> i32 as _w_connect
+from C import send(u64, cobj, i32, i32) -> i32 as _w_send
+from C import recv(u64, cobj, i32, i32) -> i32 as _w_recv
+from C import setsockopt(u64, i32, i32, cobj, i32) -> i32 as _w_setsockopt
+from C import shutdown(u64, i32) -> i32 as _w_shutdown
+from C import closesocket(u64) -> i32 as _w_close
+from C import ioctlsocket(u64, i32, Ptr[u32]) -> i32 as _w_ioctlsocket
+# POSIX / libc (fd = i32; ssize_t/size_t = int):
+from C import socket(i32, i32, i32) -> i32 as _p_socket
+from C import bind(i32, cobj, u32) -> i32 as _p_bind
+from C import listen(i32, i32) -> i32 as _p_listen
+from C import accept(i32, cobj, cobj) -> i32 as _p_accept
+from C import connect(i32, cobj, u32) -> i32 as _p_connect
+from C import send(i32, cobj, int, i32) -> int as _p_send
+from C import recv(i32, cobj, int, i32) -> int as _p_recv
+from C import setsockopt(i32, i32, i32, cobj, u32) -> i32 as _p_setsockopt
+from C import shutdown(i32, i32) -> i32 as _p_shutdown
+from C import close(i32) -> i32 as _p_close
+from C import fcntl(i32, i32, i32) -> i32 as _p_fcntl
+# identical signature on both platforms:
+from C import inet_pton(i32, cobj, cobj) -> i32 as _inet_pton
+
+# ---- constants (values diverge across platforms) ----------------------------------------
+AF_INET: Literal[int] = 2
+AF_INET6: Literal[int] = (23 if IS_WINDOWS else (30 if IS_APPLE else 10))
+SOCK_STREAM: Literal[int] = 1
+SOCK_DGRAM: Literal[int] = 2
+IPPROTO_TCP: Literal[int] = 6
+IPPROTO_UDP: Literal[int] = 17
+
+SOL_SOCKET: Literal[int] = (0xffff if (IS_WINDOWS or IS_APPLE) else 1)
+SO_REUSEADDR: Literal[int] = (4 if (IS_WINDOWS or IS_APPLE) else 2)
+SO_KEEPALIVE: Literal[int] = (8 if (IS_WINDOWS or IS_APPLE) else 9)
+SO_REUSEPORT: Literal[int] = (0x0200 if IS_APPLE else (15 if IS_LINUX else 0))
+TCP_NODELAY: Literal[int] = 1
+
+SHUT_RD: Literal[int] = 0
+SHUT_WR: Literal[int] = 1
+SHUT_RDWR: Literal[int] = 2
+
+# non-blocking switch: Windows uses ioctlsocket(FIONBIO); POSIX uses fcntl(O_NONBLOCK).
+FIONBIO: Literal[int] = 0x8004667E
+F_GETFL: Literal[int] = 3
+F_SETFL: Literal[int] = 4
+O_NONBLOCK: Literal[int] = (4 if IS_APPLE else 0o4000)
+
+INVALID_HANDLE: Literal[int] = -1
+
+# ---- one-time Winsock init --------------------------------------------------------------
+_wsa_started = False
+
+def ensure_init():
+    """Idempotent Winsock startup (no-op on POSIX)."""
+    if IS_WINDOWS:
+        global _wsa_started
+        if not _wsa_started:
+            wsadata = Ptr[byte](512)
+            rc = int(_w_wsastartup(u16(0x0202), wsadata))
+            if rc != 0:
+                raise OSCallError("WSAStartup", rc)
+            _wsa_started = True
+
+# ---- sockaddr_in builder (16 bytes, layout identical across platforms on LE hosts) ------
+class SockAddrIn:
+    ptr: Ptr[byte]
+    size: int
+
+    def __init__(self, host: str, port: int):
+        p = Ptr[byte](16)
+        i = 0
+        while i < 16:
+            p[i] = byte(0)
+            i += 1
+        # sin_family (host byte order; LE hosts -> low byte first)
+        p[0] = byte(AF_INET & 0xff)
+        p[1] = byte((AF_INET >> 8) & 0xff)
+        # sin_port (network/big-endian order)
+        p[2] = byte((port >> 8) & 0xff)
+        p[3] = byte(port & 0xff)
+        # sin_addr (network order) via inet_pton into bytes [4:8]
+        r = int(_inet_pton(i32(AF_INET), host.c_str(), (p + 4).as_byte()))
+        if r != 1:
+            raise OSCallError("inet_pton: bad IPv4 address '" + host + "'", last_error())
+        self.ptr = p
+        self.size = 16
+
+# ---- the Socket --------------------------------------------------------------------------
+class Socket:
+    fd: int
+
+    def __init__(self, fd: int = INVALID_HANDLE):
+        self.fd = fd
+
+    @property
+    def valid(self) -> bool:
+        return self.fd != INVALID_HANDLE
+
+    def fileno(self) -> int:
+        return self.fd
+
+    def _err(self, what: str):
+        raise OSCallError(what, last_error())
+
+    def setblocking(self, blocking: bool):
+        if IS_WINDOWS:
+            mode = Ptr[u32](1)
+            mode[0] = u32(0 if blocking else 1)
+            if int(_w_ioctlsocket(u64(self.fd), i32(FIONBIO), mode)) != 0:
+                self._err("ioctlsocket(FIONBIO)")
+        else:
+            flags = int(_p_fcntl(i32(self.fd), i32(F_GETFL), i32(0)))
+            if flags < 0:
+                self._err("fcntl(F_GETFL)")
+            if blocking:
+                flags &= ~O_NONBLOCK
+            else:
+                flags |= O_NONBLOCK
+            if int(_p_fcntl(i32(self.fd), i32(F_SETFL), i32(flags))) < 0:
+                self._err("fcntl(F_SETFL)")
+
+    def _setsockopt_int(self, level: int, optname: int, value: int):
+        buf = Ptr[i32](1)
+        buf[0] = i32(value)
+        if IS_WINDOWS:
+            rc = int(_w_setsockopt(u64(self.fd), i32(level), i32(optname),
+                                   buf.as_byte(), i32(4)))
+        else:
+            rc = int(_p_setsockopt(i32(self.fd), i32(level), i32(optname),
+                                   buf.as_byte(), u32(4)))
+        if rc != 0:
+            self._err("setsockopt")
+
+    def set_reuseaddr(self, on: bool = True):
+        self._setsockopt_int(SOL_SOCKET, SO_REUSEADDR, 1 if on else 0)
+
+    def set_nodelay(self, on: bool = True):
+        self._setsockopt_int(IPPROTO_TCP, TCP_NODELAY, 1 if on else 0)
+
+    def bind(self, host: str, port: int):
+        sa = SockAddrIn(host, port)
+        if IS_WINDOWS:
+            rc = int(_w_bind(u64(self.fd), sa.ptr.as_byte(), i32(sa.size)))
+        else:
+            rc = int(_p_bind(i32(self.fd), sa.ptr.as_byte(), u32(sa.size)))
+        if rc != 0:
+            self._err("bind")
+
+    def listen(self, backlog: int = 128):
+        if IS_WINDOWS:
+            rc = int(_w_listen(u64(self.fd), i32(backlog)))
+        else:
+            rc = int(_p_listen(i32(self.fd), i32(backlog)))
+        if rc != 0:
+            self._err("listen")
+
+    def accept(self) -> Socket:
+        """Accept one connection. Returns an invalid Socket (fd<0) if it would block."""
+        nul = cobj()
+        if IS_WINDOWS:
+            h = int(_w_accept(u64(self.fd), nul, nul))
+        else:
+            h = int(_p_accept(i32(self.fd), nul, nul))
+        if h == INVALID_HANDLE:
+            e = last_error()
+            if would_block(e):
+                return Socket(INVALID_HANDLE)
+            raise OSCallError("accept", e)
+        return Socket(h)
+
+    def connect(self, host: str, port: int) -> bool:
+        """Connect. Returns True if established, False if in progress (non-blocking)."""
+        sa = SockAddrIn(host, port)
+        if IS_WINDOWS:
+            rc = int(_w_connect(u64(self.fd), sa.ptr.as_byte(), i32(sa.size)))
+        else:
+            rc = int(_p_connect(i32(self.fd), sa.ptr.as_byte(), u32(sa.size)))
+        if rc == 0:
+            return True
+        e = last_error()
+        if e == EINPROGRESS or would_block(e):
+            return False
+        raise OSCallError("connect", e)
+
+    def recv_into(self, buf: Ptr[byte], n: int) -> int:
+        """Read up to n bytes. Returns count, 0 on EOF, -1 if it would block."""
+        if IS_WINDOWS:
+            r = int(_w_recv(u64(self.fd), buf.as_byte(), i32(n), i32(0)))
+        else:
+            r = int(_p_recv(i32(self.fd), buf.as_byte(), n, i32(0)))
+        if r < 0:
+            if would_block(last_error()):
+                return -1
+            self._err("recv")
+        return r
+
+    def send_from(self, buf: Ptr[byte], n: int) -> int:
+        """Write up to n bytes. Returns count, -1 if it would block."""
+        if IS_WINDOWS:
+            r = int(_w_send(u64(self.fd), buf.as_byte(), i32(n), i32(0)))
+        else:
+            r = int(_p_send(i32(self.fd), buf.as_byte(), n, i32(0)))
+        if r < 0:
+            if would_block(last_error()):
+                return -1
+            self._err("send")
+        return r
+
+    def recv(self, n: int) -> str:
+        """Blocking-style read of up to n bytes as a byte string ('' on EOF)."""
+        buf = Ptr[byte](n)
+        r = self.recv_into(buf, n)
+        if r <= 0:
+            return ""
+        return str(buf, r)
+
+    def send(self, data: str) -> int:
+        """Send all of `data`; returns bytes sent."""
+        total = 0
+        n = len(data)
+        while total < n:
+            s = self.send_from(data._ptr + total, n - total)
+            if s < 0:
+                continue  # would-block on a blocking socket shouldn't happen; spin
+            total += s
+        return total
+
+    def shutdown(self, how: int = SHUT_RDWR):
+        if IS_WINDOWS:
+            _w_shutdown(u64(self.fd), i32(how))
+        else:
+            _p_shutdown(i32(self.fd), i32(how))
+
+    def close(self):
+        if self.fd == INVALID_HANDLE:
+            return
+        if IS_WINDOWS:
+            _w_close(u64(self.fd))
+        else:
+            _p_close(i32(self.fd))
+        self.fd = INVALID_HANDLE
+
+# ---- factories ---------------------------------------------------------------------------
+def tcp_socket() -> Socket:
+    ensure_init()
+    if IS_WINDOWS:
+        h = int(_w_socket(i32(AF_INET), i32(SOCK_STREAM), i32(IPPROTO_TCP)))
+    else:
+        h = int(_p_socket(i32(AF_INET), i32(SOCK_STREAM), i32(IPPROTO_TCP)))
+    if h == INVALID_HANDLE:
+        raise OSCallError("socket", last_error())
+    return Socket(h)
+
+def listen_tcp(host: str = "0.0.0.0", port: int = 8000, backlog: int = 128,
+               reuseaddr: bool = True) -> Socket:
+    s = tcp_socket()
+    if reuseaddr:
+        s.set_reuseaddr(True)
+    s.bind(host, port)
+    s.listen(backlog)
+    return s
+
+def connect_tcp(host: str, port: int) -> Socket:
+    s = tcp_socket()
+    s.connect(host, port)
+    return s

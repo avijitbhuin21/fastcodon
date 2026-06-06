@@ -1,0 +1,184 @@
+# fastcodon.net.selector — P12: cross-platform I/O readiness selector.
+#
+# v1 backend = poll(2) on POSIX / WSAPoll on Windows. This is deliberately the portable,
+# arch-safe choice: epoll's `struct epoll_event` is packed differently on x86-64 vs arm64, and
+# kqueue/IOCP are platform-specific — whereas poll/WSAPoll have one uniform shape on every
+# Linux arch, macOS, and Windows. The reactor (P31) talks only to this `Selector` interface, so
+# an epoll/kqueue/IOCP fast-path can replace this later with no change above it.
+#
+# A registration carries an opaque integer `token` (the reactor maps it to callbacks/futures).
+
+from ..sys.config import IS_WINDOWS
+from ..sys.oserror import last_error, OSCallError, EINTR
+
+if IS_WINDOWS:
+    from C import WSAPoll(cobj, u32, i32) -> i32 as _w_poll
+else:
+    from C import poll(cobj, u64, i32) -> i32 as _p_poll
+
+# ---- event flags (public) ----------------------------------------------------------------
+# Values map onto the platform's poll constants; callers use EV_READ / EV_WRITE only.
+EV_READ: Literal[int] = (0x0100 if IS_WINDOWS else 0x001)    # win POLLRDNORM / posix POLLIN
+EV_WRITE: Literal[int] = (0x0010 if IS_WINDOWS else 0x004)   # win POLLWRNORM / posix POLLOUT
+_POLLERR: Literal[int] = (0x0001 if IS_WINDOWS else 0x008)
+_POLLHUP: Literal[int] = (0x0002 if IS_WINDOWS else 0x010)
+_POLLNVAL: Literal[int] = (0x0004 if IS_WINDOWS else 0x020)
+EV_ERROR: Literal[int] = _POLLERR | _POLLHUP | _POLLNVAL
+
+# ---- pollfd memory layout (per platform) -------------------------------------------------
+# POSIX  struct pollfd  { int fd; short events; short revents; }            -> 8-byte stride
+# Windows WSAPOLLFD     { SOCKET fd; SHORT events; SHORT revents; pad }     -> 16-byte stride
+_STRIDE: Literal[int] = (16 if IS_WINDOWS else 8)
+_EV_OFF: Literal[int] = (8 if IS_WINDOWS else 4)
+_RE_OFF: Literal[int] = (10 if IS_WINDOWS else 6)
+
+# ---- little-endian byte packing helpers (avoids pointer-cast assumptions) -----------------
+def _wr_fd(base: Ptr[byte], off: int, fd: int):
+    if IS_WINDOWS:
+        x = u64(fd)
+        k = 0
+        while k < 8:
+            base[off + k] = byte(int((x >> u64(8 * k)) & u64(0xff)))
+            k += 1
+    else:
+        x = fd & 0xffffffff
+        k = 0
+        while k < 4:
+            base[off + k] = byte((x >> (8 * k)) & 0xff)
+            k += 1
+
+def _wr_i16(base: Ptr[byte], off: int, v: int):
+    base[off] = byte(v & 0xff)
+    base[off + 1] = byte((v >> 8) & 0xff)
+
+def _rd_i16(base: Ptr[byte], off: int) -> int:
+    return int(base[off]) | (int(base[off + 1]) << 8)
+
+
+class SelectorKey:
+    fd: int
+    events: int
+    token: int
+
+    def __init__(self, fd: int, events: int, token: int):
+        self.fd = fd
+        self.events = events
+        self.token = token
+
+
+class Event:
+    fd: int
+    revents: int
+    token: int
+
+    def __init__(self, fd: int, revents: int, token: int):
+        self.fd = fd
+        self.revents = revents
+        self.token = token
+
+    @property
+    def readable(self) -> bool:
+        return (self.revents & (EV_READ | _POLLHUP | _POLLERR)) != 0
+
+    @property
+    def writable(self) -> bool:
+        return (self.revents & EV_WRITE) != 0
+
+    @property
+    def errored(self) -> bool:
+        return (self.revents & (_POLLERR | _POLLNVAL)) != 0
+
+
+class Selector:
+    _keys: List[SelectorKey]
+    _index: Dict[int, int]     # fd -> position in _keys
+    _buf: Ptr[byte]
+    _cap: int
+
+    def __init__(self):
+        self._keys = []
+        self._index = {}
+        self._buf = Ptr[byte]()
+        self._cap = 0
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def register(self, fd: int, events: int, token: int = 0):
+        if fd in self._index:
+            raise OSCallError("selector: fd already registered", 0)
+        self._index[fd] = len(self._keys)
+        self._keys.append(SelectorKey(fd, events, token))
+
+    def modify(self, fd: int, events: int):
+        pos = self._index.get(fd, -1)
+        if pos < 0:
+            raise OSCallError("selector: fd not registered", 0)
+        self._keys[pos].events = events
+
+    def unregister(self, fd: int):
+        pos = self._index.get(fd, -1)
+        if pos < 0:
+            return
+        last = len(self._keys) - 1
+        if pos != last:
+            moved = self._keys[last]
+            self._keys[pos] = moved
+            self._index[moved.fd] = pos
+        self._keys.pop()
+        del self._index[fd]
+
+    def _ensure_cap(self, n: int):
+        need = n * _STRIDE
+        if need > self._cap:
+            self._buf = Ptr[byte](need)
+            self._cap = need
+
+    def select(self, timeout_ms: int = -1) -> List[Event]:
+        """Return the ready events. timeout_ms < 0 blocks indefinitely; 0 polls."""
+        n = len(self._keys)
+        out = List[Event]()
+        if n == 0:
+            return out
+        self._ensure_cap(n)
+        base = self._buf
+        i = 0
+        while i < n:
+            off = i * _STRIDE
+            k = off
+            while k < off + _STRIDE:
+                base[k] = byte(0)
+                k += 1
+            key = self._keys[i]
+            _wr_fd(base, off, key.fd)
+            _wr_i16(base, off + _EV_OFF, key.events)
+            i += 1
+
+        rc = 0
+        if IS_WINDOWS:
+            rc = int(_w_poll(base.as_byte(), u32(n), i32(timeout_ms)))
+        else:
+            rc = int(_p_poll(base.as_byte(), u64(n), i32(timeout_ms)))
+        if rc < 0:
+            e = last_error()
+            if e == EINTR:
+                return out            # interrupted; caller re-polls
+            raise OSCallError("poll", e)
+        if rc == 0:
+            return out                # timeout
+
+        i = 0
+        while i < n:
+            off = i * _STRIDE
+            re = _rd_i16(base, off + _RE_OFF)
+            if re != 0:
+                key = self._keys[i]
+                out.append(Event(key.fd, re, key.token))
+            i += 1
+        return out
+
+    def close(self):
+        self._keys = []
+        self._index = {}
+        self._buf = Ptr[byte]()
+        self._cap = 0

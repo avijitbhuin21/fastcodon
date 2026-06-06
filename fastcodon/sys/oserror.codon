@@ -1,0 +1,54 @@
+# fastcodon.sys.oserror — cross-platform "last error" access for syscalls/FFI.
+#
+# Windows socket calls report failure via WSAGetLastError() (ws2_32), which is distinct
+# from the CRT `errno`. POSIX reports via the thread-local `errno`, reached through
+# `__errno_location()` on Linux and `__error()` on macOS.
+
+from .config import IS_WINDOWS, IS_APPLE
+
+if IS_WINDOWS:
+    from C import WSAGetLastError() -> i32 as _wsa_last_error
+else:
+    if IS_APPLE:
+        from C import __error() -> Ptr[i32] as _errno_loc
+    else:
+        from C import __errno_location() -> Ptr[i32] as _errno_loc
+
+
+# Common error numbers we care about (values differ per platform).
+# "operation would block" on a non-blocking socket:
+EWOULDBLOCK: Literal[int] = (10035 if IS_WINDOWS else (35 if IS_APPLE else 11))
+# "connection attempt in progress" (non-blocking connect):
+EINPROGRESS: Literal[int] = (10036 if IS_WINDOWS else (36 if IS_APPLE else 115))
+# "interrupted system call":
+EINTR: Literal[int] = (10004 if IS_WINDOWS else 4)
+# On POSIX EAGAIN may differ from EWOULDBLOCK on some arches; here they coincide.
+EAGAIN: Literal[int] = EWOULDBLOCK
+
+
+def last_error() -> int:
+    """The OS error code for the most recent failed socket/FFI call (this thread)."""
+    if IS_WINDOWS:
+        return int(_wsa_last_error())
+    else:
+        return int(_errno_loc()[0])
+
+
+def would_block(err: int) -> bool:
+    """True if `err` means 'retry later' on a non-blocking socket."""
+    return err == EWOULDBLOCK or err == EAGAIN
+
+
+class OSCallError(Exception):
+    code: int
+
+    def __init__(self, msg: str, code: int = 0):
+        super().__init__(msg + " (error " + str(code) + ")")
+        self.code = code
+
+
+def check(ret: int, what: str) -> int:
+    """Raise OSCallError(last_error) if `ret` indicates failure (negative)."""
+    if ret < 0:
+        raise OSCallError(what + " failed", last_error())
+    return ret

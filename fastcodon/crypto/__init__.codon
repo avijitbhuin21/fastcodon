@@ -1,0 +1,6 @@
+# fastcodon.crypto — P13: pure-Codon crypto primitives (no FFI, fully portable).
+# SHA-1 + base64 drive the WebSocket handshake; SHA-256 + HMAC + base64url drive JWT/OAuth2.
+from .base64 import b64encode, b64decode
+from .sha1 import sha1, sha1_hex
+from .sha256 import sha256, sha256_hex
+from .hmac import hmac_sha256, hmac_sha256_hex

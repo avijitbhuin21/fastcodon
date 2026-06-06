@@ -1,0 +1,40 @@
+# Verifies the fastcodon L1 native leaves (sockets/selector/crypto/reactor/TLS) on REAL
+# Linux and macOS runners (both arches) using stock upstream Codon. This is the cross-platform
+# "deploy for all types" gate for the POSIX backend — the Windows backend is verified separately
+# with the native-Windows Codon build (it isn't in upstream releases yet).
+
+name: fastcodon-leaves
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  posix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    name: "Linux x86_64 (glibc)" }
+          - { os: ubuntu-24.04-arm, name: "Linux arm64 (glibc)" }
+          - { os: macos-latest,     name: "macOS arm64" }
+          - { os: macos-13,         name: "macOS x86_64" }
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Codon (upstream release)
+        run: |
+          /bin/bash -c "$(curl -fsSL https://exaloop.io/install.sh)"
+          echo "$HOME/.codon/bin" >> "$GITHUB_PATH"
+
+      - name: Codon version
+        run: codon --version
+
+      - name: Generate platform config for this OS
+        run: bash scripts/setup.sh
+
+      - name: Run leaf tests (sockets / selector / crypto / reactor / TLS)
+        run: bash scripts/run_tests.sh

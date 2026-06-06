@@ -1,0 +1,72 @@
+# fastcodon.crypto.base64 — RFC 4648 base64 (standard + url-safe).
+
+_STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+def b64encode(data: str, urlsafe: bool = False, pad: bool = True) -> str:
+    alpha = _URL if urlsafe else _STD
+    n = len(data)
+    out = List[byte]()
+    i = 0
+    while i + 3 <= n:
+        b0 = int(data._ptr[i]); b1 = int(data._ptr[i + 1]); b2 = int(data._ptr[i + 2])
+        out.append(alpha._ptr[b0 >> 2])
+        out.append(alpha._ptr[((b0 & 0x3) << 4) | (b1 >> 4)])
+        out.append(alpha._ptr[((b1 & 0xf) << 2) | (b2 >> 6)])
+        out.append(alpha._ptr[b2 & 0x3f])
+        i += 3
+    rem = n - i
+    if rem == 1:
+        b0 = int(data._ptr[i])
+        out.append(alpha._ptr[b0 >> 2])
+        out.append(alpha._ptr[(b0 & 0x3) << 4])
+        if pad:
+            out.append(byte(61)); out.append(byte(61))   # '=='
+    elif rem == 2:
+        b0 = int(data._ptr[i]); b1 = int(data._ptr[i + 1])
+        out.append(alpha._ptr[b0 >> 2])
+        out.append(alpha._ptr[((b0 & 0x3) << 4) | (b1 >> 4)])
+        out.append(alpha._ptr[(b1 & 0xf) << 2])
+        if pad:
+            out.append(byte(61))                          # '='
+    return str(out._ptr, len(out))
+
+def _rev(c: int) -> int:
+    # decode one base64 char (accepts both standard and url-safe alphabets); -1 if invalid
+    if 65 <= c <= 90:      # A-Z
+        return c - 65
+    if 97 <= c <= 122:     # a-z
+        return c - 97 + 26
+    if 48 <= c <= 57:      # 0-9
+        return c - 48 + 52
+    if c == 43 or c == 45: # + or -
+        return 62
+    if c == 47 or c == 95: # / or _
+        return 63
+    return -1
+
+def b64decode(s: str) -> str:
+    out = List[byte]()
+    quad = [0, 0, 0, 0]
+    q = 0
+    i = 0
+    n = len(s)
+    while i < n:
+        c = int(s._ptr[i]); i += 1
+        if c == 61:        # '=' padding -> stop collecting
+            break
+        v = _rev(c)
+        if v < 0:
+            continue       # skip whitespace/newlines
+        quad[q] = v; q += 1
+        if q == 4:
+            out.append(byte(((quad[0] << 2) | (quad[1] >> 4)) & 0xff))
+            out.append(byte(((quad[1] << 4) | (quad[2] >> 2)) & 0xff))
+            out.append(byte(((quad[2] << 6) | quad[3]) & 0xff))
+            q = 0
+    if q == 2:
+        out.append(byte(((quad[0] << 2) | (quad[1] >> 4)) & 0xff))
+    elif q == 3:
+        out.append(byte(((quad[0] << 2) | (quad[1] >> 4)) & 0xff))
+        out.append(byte(((quad[1] << 4) | (quad[2] >> 2)) & 0xff))
+    return str(out._ptr, len(out))

@@ -1,0 +1,12 @@
+# build artifacts
+*.exe
+*.pdb
+*.ll
+*.o
+*.obj
+a.out
+a.exe
+/build/
+# editor/OS cruft
+.DS_Store
+Thumbs.db
