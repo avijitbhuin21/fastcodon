@@ -17,7 +17,7 @@ PORT = 443
 def _wait(sel: Selector, fd: int, status: int):
     ev = EV_READ if status == TLS_WANT_READ else EV_WRITE
     sel.modify(fd, ev)
-    sel.select(5000)
+    sel.select(2000)
 
 def main():
     print("OpenSSL:", openssl_version())
@@ -31,9 +31,9 @@ def main():
     sel = Selector()
     sel.register(sock.fd, EV_WRITE)
     cwait = 0
-    while cwait < 20:                       # wait for TCP connect to complete (writable)
+    while cwait < 8:                       # wait for TCP connect to complete (writable)
         cwait += 1
-        ready = sel.select(3000)
+        ready = sel.select(2000)
         if len(ready) > 0:
             break
     print("tcp connected after", cwait, "wait(s)")
@@ -44,7 +44,7 @@ def main():
 
     # drive the non-blocking handshake
     tries = 0
-    while tries < 50:
+    while tries < 25:
         tries += 1
         st = conn.handshake()
         if st == TLS_OK:
@@ -64,19 +64,19 @@ def main():
         if st > 0:
             sent = True
         else:
-            sel.modify(sock.fd, EV_WRITE); sel.select(5000)
+            sel.modify(sock.fd, EV_WRITE); sel.select(2000)
 
     # read the response head
     sel.modify(sock.fd, EV_READ)
     resp = ""
     reads = 0
-    while reads < 50 and len(resp) < 256:
+    while reads < 25 and len(resp) < 256:
         reads += 1
         data = conn.read(512)
         if data != "":
             resp += data
         else:
-            sel.select(3000)
+            sel.select(2000)
     head = resp.split("\r\n")[0] if resp != "" else "(empty)"
     print("HTTP status line:", head)
     assert head.startswith("HTTP/1.1"), "did not get an HTTP response"

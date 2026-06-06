@@ -25,15 +25,19 @@ interpreter, no Rust `pydantic-core`, no C extension shims). The output is a Cod
 > and the async reactor `fastcodon/reactor.codon` (P31).
 >
 > **Cross-platform verification matrix:**
-> - **Windows** — ✔️ *runtime-verified* (JIT + native AOT): non-blocking TCP echo, selector echo,
->   RFC crypto vectors, a 5-client async echo server, and a real **TLS 1.3 handshake + HTTPS GET**.
-> - **Linux x86_64/arm64** & **macOS arm64/x86_64** — ✔️ *static-verified now, runtime-gated in CI*:
->   the POSIX/`__apple__` branches compile to correct LLVM IR (right per-OS symbols — `poll`,
->   `__errno_location` on Linux vs `__error` on macOS, **zero** Windows symbols), and every
->   platform-divergent constant was audited against system headers. Actual execution runs on real
->   Linux + macOS runners via `.github/workflows/leaves-ci.yml` (stock upstream Codon) — the
->   "deploy for all types" gate. Local Linux/macOS execution wasn't possible on the dev box (BIOS
->   virtualization disabled → WSL2/Docker unavailable; no Mac).
+> - **Windows** x86_64 — ✔️ *runtime-verified* (JIT + native AOT): non-blocking TCP echo, selector
+>   echo, RFC crypto vectors, a 5-client async echo server, and a real **TLS 1.3 handshake + HTTPS GET**.
+> - **Linux x86_64** & **Linux arm64** (glibc) — ✔️ *runtime-verified on real CI runners* (stock
+>   upstream Codon v0.19.6) via `.github/workflows/leaves-ci.yml`: sockets, selector, crypto, and
+>   the async reactor all green. Repo: `github.com/avijitbhuin21/fastcodon`.
+> - **macOS arm64/x86_64** — same CI matrix (running). Plus all four platforms were *static-verified*:
+>   POSIX/`__apple__` branches compile to correct LLVM IR (right per-OS symbols — `poll`,
+>   `__errno_location` on Linux vs `__error` on macOS, **zero** Windows symbols) and every
+>   platform-divergent constant was audited against system headers.
+>
+> Two real portability bugs were caught and fixed by this CI vs. the Windows-fork build: stock Codon
+> uses `str.ptr`/`.len` (fork uses `_ptr`/`_len`) — fixed by going through the public `ord()`/
+> `str(ptr,len)` API (`fastcodon/sys/buf.codon`); and stock Codon's parser rejects `0o` octal literals.
 >
 > See `codon-libraries/README.md` for the toolchain + how to build/run.
 
