@@ -152,6 +152,9 @@ class Reactor:
                 if ev.fd not in self.handlers:
                     continue
                 h = self.handlers[ev.fd]
+                if _d <= 12:
+                    print("[rx]  disp fd", ev.fd, "re", ev.revents, "rd", int(ev.readable),
+                          "wr", int(ev.writable), file=_stderr_fp())
                 if ev.errored:
                     h.on_error()
                     continue
@@ -159,6 +162,8 @@ class Reactor:
                     self.handlers[ev.fd].on_readable()
                 if ev.writable and ev.fd in self.handlers:
                     self.handlers[ev.fd].on_writable()
+                if _d <= 12:
+                    print("[rx]  done fd", ev.fd, file=_stderr_fp())
             self._run_due_timers()
 
     def close(self):

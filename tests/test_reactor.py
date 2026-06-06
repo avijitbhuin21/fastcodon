@@ -51,8 +51,11 @@ class Acceptor(IOHandler):
         self.server = server
 
     def on_readable(self):
+        loops = 0
         while True:
+            loops += 1
             c = self.server.accept()
+            dbg("  accept loop", loops, "valid", c.valid, "fd", c.fd)
             if not c.valid:
                 break
             c.setblocking(False)
