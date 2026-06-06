@@ -1,0 +1,93 @@
+# fastcodon.asgi.types — P41: the no-`await` ASGI value types.
+#
+# Python ASGI is `async def app(scope, receive, send)`. Codon has no `await`, and (per the rest of
+# fastcodon) closures don't unify to a single callable type, so the v1 application interface is a
+# *base class with a virtual method* instead of a coroutine:
+#
+#     class ASGIApp:
+#         def handle(self, scope: Scope, body: str) -> Response: ...
+#
+# This is a faithful-but-BUFFERED contract: the whole request (a parsed `Scope` plus the fully
+# read request `body`) goes in, one `Response` (status + headers + buffered body) comes out. It is
+# enough to unblock routing / the FastAPI layer above. Streaming `receive`/`send` channels (a
+# generator/continuation-driven body in, chunked body out) are a deferred enrichment of this same
+# contract — `handle` would gain `recv`/`send` continuation objects — and are NOT implemented in v1.
+
+from ..http.parser import Request
+
+
+class Scope:
+    """The parsed request as a plain value (the ASGI 'http' scope)."""
+    type: str                          # always "http" in v1
+    method: str
+    path: str                          # request-target up to '?'
+    query_string: str                  # everything after '?' (no leading '?'), "" if none
+    http_version: str                  # e.g. "1.1"
+    headers: List[Tuple[str, str]]     # original order + casing preserved
+
+    def __init__(self, type: str, method: str, path: str, query_string: str,
+                 http_version: str, headers: List[Tuple[str, str]]):
+        self.type = type
+        self.method = method
+        self.path = path
+        self.query_string = query_string
+        self.http_version = http_version
+        self.headers = headers
+
+    def get(self, name: str) -> Optional[str]:
+        """Case-insensitive header lookup; first match or None."""
+        key = name.lower()
+        for (k, v) in self.headers:
+            if k.lower() == key:
+                return v
+        return None
+
+
+def scope_from_request(req: Request) -> Scope:
+    """Build an http Scope from a parsed Request, splitting the target into path + query."""
+    target = req.target
+    q = target.find("?")
+    if q < 0:
+        path = target
+        query = ""
+    else:
+        path = target[:q]
+        query = target[q + 1:]
+    return Scope("http", req.method, path, query, req.http_version, req.headers)
+
+
+class Response:
+    """A buffered HTTP response: status line + headers + a fully-materialized body."""
+    status: int
+    headers: List[Tuple[str, str]]
+    body: str
+
+    def __init__(self, status: int, headers: List[Tuple[str, str]], body: str):
+        self.status = status
+        self.headers = headers
+        self.body = body
+
+    @staticmethod
+    def plain(status: int, body: str, content_type: str) -> Response:
+        """Construct a response with a single Content-Type header (Content-Length is added by the
+        transport at serialization time, so the app never has to compute byte lengths)."""
+        h = List[Tuple[str, str]]()
+        h.append(("Content-Type", content_type))
+        return Response(status, h, body)
+
+    @staticmethod
+    def text(body: str, status: int = 200) -> Response:
+        return Response.plain(status, body, "text/plain; charset=utf-8")
+
+    @staticmethod
+    def json(obj_str: str, status: int = 200) -> Response:
+        """`obj_str` is an already-serialized JSON string."""
+        return Response.plain(status, obj_str, "application/json")
+
+
+class ASGIApp:
+    """v1 application base class. Override `handle`: full request (scope + buffered body) in, one
+    Response out. Virtual dispatch (closures don't unify in Codon). Streaming receive/send channels
+    are a deferred enrichment of this contract (see module docstring)."""
+    def handle(self, scope: Scope, body: str) -> Response:
+        return Response.text("Not Implemented", status=501)

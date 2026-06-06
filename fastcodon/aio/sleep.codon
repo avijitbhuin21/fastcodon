@@ -1,0 +1,37 @@
+# fastcodon.aio.sleep — P33: the canonical async "task".
+#
+# sleep(r, delay) returns a Completion that the reactor completes (success) after `delay`
+# seconds, via a TimerCallback scheduled on the reactor's timer queue. This is the simplest
+# async operation that fits the Completion/Continuation model from streams.codon: there is no
+# I/O, just time, so it is the ideal task to exercise TaskGroup / CancelScope / Event with.
+#
+# Cancellation travels the SAME path as everywhere else in this codebase: a CancelScope (or a
+# deadline) completes the returned Completion with errored=True. If the timer subsequently
+# fires it sees the Completion already done and does nothing (Completion._complete is a no-op
+# once done), so a cancelled sleep never "un-cancels" itself.
+
+from ..reactor import Reactor, TimerCallback, TimerEntry
+from .streams import Completion
+
+
+class _WakeCB(TimerCallback):
+    """Reactor timer callback: complete the sleep's Completion successfully when the delay
+    elapses. References only the Completion (a primitive-ish holder) — one-directional, no cycle."""
+    c: Completion
+
+    def __init__(self, c: Completion):
+        self.c = c
+
+    def run(self):
+        # success completion; if already cancelled (errored), _complete is a no-op.
+        self.c._complete("", 0, False, False)
+
+
+def sleep(r: Reactor, delay: float) -> Completion:
+    """Return a Completion that completes successfully after `delay` seconds on the reactor.
+
+    Poll `c.done`, or attach a Continuation via `c.then(cont)`. To cancel, complete the
+    Completion with errored=True (e.g. via a CancelScope) — the pending timer then no-ops."""
+    c = Completion()
+    r.call_later(delay, _WakeCB(c))
+    return c

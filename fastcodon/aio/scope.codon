@@ -1,0 +1,134 @@
+# fastcodon.aio.scope — P33: a CancelScope (anyio's cancel scope) built on the Timeout primitive.
+#
+# A CancelScope owns:
+#   * an optional deadline — a Timeout whose TimeoutAction cancels the scope when it fires;
+#   * a `cancelled` flag (set by cancel() or by the deadline firing);
+#   * a list of child Completions registered via add(c).
+# cancel() (and the deadline firing) completes every not-yet-done child with errored=True.
+# Cancellation thus travels the SAME channel as I/O errors / EOF (Completion._complete with
+# errored=True), so any Continuation attached to a child already handles it through its normal
+# `if self.errored:` path — there is no separate cancellation signal.
+#
+# NO `with`-await form exists (the reactor is callback-based, no coroutines), so the scope is
+# driven explicitly:
+#       sc = CancelScope(r, deadline=0.05)   # <0 (the default) means "no deadline"
+#       sc.open()                            # arm the deadline timer
+#       sc.add(sleep(r, 1.0))                # register guarded operations
+#       ... run the reactor ...
+#       sc.close()                           # disarm the deadline (no-op if already fired/closed)
+# A deadline of <0 means "no deadline" (open() arms nothing). `deadline_expired` reports whether
+# it was specifically the deadline (vs a manual cancel()) that cancelled the scope, mirroring
+# anyio's cancelled_caught/“the deadline fired” distinction.
+#
+# Type-cycle note (Codon resolves field/param annotations EAGERLY): CancelScope references
+# Timeout/Completion, but NEITHER references CancelScope — the scope's TimeoutAction (_DeadlineAction)
+# holds the scope, and the dependency stays one-directional (scope -> action -> scope is fine since
+# _DeadlineAction is defined AFTER CancelScope and only stores it, never the reverse). To keep that
+# ordering legal we give the action a tiny shared `_ScopeState` rather than the whole scope, exactly
+# like timeout.codon's _Flag trick.
+
+from ..reactor import Reactor
+from .streams import Completion
+from .timeout import Timeout, TimeoutAction
+
+
+class _ScopeState:
+    """Shared mutable state held by BOTH the CancelScope and its deadline action, so the action
+    can cancel the scope without an action<->scope annotation cycle (the _Flag trick)."""
+    cancelled: bool
+    deadline_expired: bool
+    children: List[Completion]
+
+    def __init__(self):
+        self.cancelled = False
+        self.deadline_expired = False
+        self.children = []
+
+    def do_cancel(self, by_deadline: bool):
+        if self.cancelled:
+            return
+        self.cancelled = True
+        if by_deadline:
+            self.deadline_expired = True
+        # Cancellation == complete each not-yet-done child with errored=True (same path as I/O err).
+        for c in self.children:
+            if not c.done:
+                c._complete("", 0, False, True)
+
+
+class _DeadlineAction(TimeoutAction):
+    """The Timeout's action: when the deadline fires, cancel the scope (flagged as a deadline)."""
+    state: _ScopeState
+
+    def __init__(self, state: _ScopeState):
+        self.state = state
+
+    def run(self):
+        self.state.do_cancel(True)
+
+
+class CancelScope:
+    """Groups operations under a single cancellation source (manual or a deadline).
+
+    deadline < 0 (default) -> no deadline; open() arms nothing."""
+    r: Reactor
+    deadline: float
+    state: _ScopeState
+    timer: Optional[Timeout]
+    opened: bool
+    closed: bool
+
+    def __init__(self, r: Reactor, deadline: float = -1.0):
+        self.r = r
+        self.deadline = deadline
+        self.state = _ScopeState()
+        self.timer = None
+        self.opened = False
+        self.closed = False
+
+    @property
+    def cancelled(self) -> bool:
+        return self.state.cancelled
+
+    @property
+    def deadline_expired(self) -> bool:
+        """True iff the scope was cancelled specifically because its deadline fired."""
+        return self.state.deadline_expired
+
+    @property
+    def cancelled_caught(self) -> bool:
+        """anyio-style: did this scope catch a cancellation (manual or deadline)?"""
+        return self.state.cancelled
+
+    def add(self, c: Completion) -> Completion:
+        """Register a child operation under this scope. If the scope is already cancelled, the
+        child is cancelled immediately. Returns the same Completion for chaining."""
+        if self.state.cancelled:
+            if not c.done:
+                c._complete("", 0, False, True)
+            return c
+        self.state.children.append(c)
+        return c
+
+    def open(self) -> CancelScope:
+        """Arm the deadline timer (if any). Returns self for chaining."""
+        if self.opened or self.closed:
+            return self
+        self.opened = True
+        if self.deadline >= 0.0:
+            self.timer = Timeout(self.r, self.deadline, _DeadlineAction(self.state)).start()
+        return self
+
+    def cancel(self):
+        """Manually cancel the scope: complete every not-yet-done child with errored=True."""
+        self.state.do_cancel(False)
+
+    def close(self):
+        """Disarm the deadline timer. Does NOT cancel children (they completed or were cancelled)."""
+        if self.closed:
+            return
+        self.closed = True
+        t = self.timer
+        if t is not None:
+            t.done()
+            self.timer = None

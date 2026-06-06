@@ -1,0 +1,77 @@
+# fastcodon.asgi.server — P41: the ASGI server core (uvicorn-equivalent).
+#
+# A `Server` owns a non-blocking listening Socket registered on the Reactor for read. on_readable
+# accepts in a loop (until accept() returns an invalid socket), wraps each accepted socket in a
+# Stream, and starts an HTTPConnection bound to the configured ASGIApp. Mirrors the accept-loop in
+# tests/test_reactor.py.
+
+from ..net.socket import listen_tcp, Socket
+from ..net.selector import EV_READ
+from ..reactor import Reactor, IOHandler
+from ..aio.streams import wrap_stream
+from .types import ASGIApp
+from .http_transport import HTTPConnection
+
+
+class LifespanHook:
+    """Startup/shutdown callback base class. Override run(). v1 no-op stub.
+    TODO: drive a full ASGI lifespan scope (startup/shutdown events) once needed."""
+    def run(self):
+        pass
+
+
+class Server(IOHandler):
+    r: Reactor
+    app: ASGIApp
+    listener: Socket
+    host: str
+    port: int
+    started: bool
+
+    def __init__(self, r: Reactor, app: ASGIApp, host: str, port: int):
+        self.r = r
+        self.app = app
+        self.host = host
+        self.port = port
+        self.listener = Socket()
+        self.started = False
+
+    def serve(self):
+        """Bind/listen and register on the reactor. Does NOT run the loop (call run())."""
+        self.listener = listen_tcp(self.host, self.port, backlog=128)
+        self.listener.set_reuseaddr(True)
+        self.listener.setblocking(False)
+        self.r.register(self.listener.fd, self, EV_READ)
+        self.started = True
+
+    def run(self):
+        """Convenience: serve() if needed, then drive the reactor."""
+        if not self.started:
+            self.serve()
+        self.r.run_forever()
+
+    def stop(self):
+        if self.started and self.listener.valid:
+            self.r.unregister(self.listener.fd)
+            self.listener.close()
+            self.started = False
+        self.r.stop()
+
+    # ---- IOHandler: accept fan-out --------------------------------------------------------
+    def on_readable(self):
+        while True:
+            c = self.listener.accept()
+            if not c.valid:
+                break
+            stream = wrap_stream(self.r, c)
+            conn = HTTPConnection(stream, self.app)
+            conn.start()
+
+
+def serve(app: ASGIApp, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Run a Server for `app` on its own Reactor until stopped (blocking)."""
+    r = Reactor()
+    srv = Server(r, app, host, port)
+    srv.serve()
+    r.run_forever()
+    r.close()

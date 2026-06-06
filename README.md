@@ -25,9 +25,11 @@ The **L2 pure-Codon codec layer** and **L3 async streams** are also done and JIT
 | **HTTP/1.1** (P23) | `fastcodon/http/*` | sans-I/O request parser (Content-Length + chunked, keep-alive, incremental feed) | ✔️ vectors |
 | **WebSocket** (P24) | `fastcodon/websocket/*` | RFC 6455 frame codec + handshake (reuses `crypto`) | ✔️ byte-exact §5.7 vectors |
 | **multipart** (P25) | `fastcodon/multipart/*` | streaming `multipart/form-data` parser | ✔️ vectors |
-| **async streams** (P32) | `fastcodon/aio/*` | buffered read/write + backpressure over the reactor; timeout primitive (P33 seed) | ✔️ loopback echo |
+| **async streams** (P32) | `fastcodon/aio/streams.codon` | buffered read/write + backpressure over the reactor | ✔️ loopback echo |
+| **structured concurrency** (P33) | `fastcodon/aio/{scope,taskgroup,sync,sleep}.codon` | CancelScope, TaskGroup, Event, Semaphore, sleep — on the timer queue | ✔️ taskgroup/deadline/event |
+| **ASGI server + HTTP transport** (P41/P42) | `fastcodon/asgi/*` | accept loop on the reactor → `http` parser → `ASGIApp.handle` → response; keep-alive | ✔️ serves `{"hello":"world"}` over real HTTP |
 
-Tests: `test_json` · `test_urllib` · `test_http` · `test_websocket` · `test_multipart` · `test_streams` (all print `PASS:`).
+Tests: `test_json` · `test_urllib` · `test_http` · `test_websocket` · `test_multipart` · `test_streams` · `test_concurrency` · `test_server` (all print `PASS:`).
 
 ### Per-platform verification
 

@@ -1,0 +1,129 @@
+# fastcodon.aio.taskgroup — P33: a TaskGroup (anyio's task group / nursery) on top of CancelScope.
+#
+# A TaskGroup is a CancelScope owning N child Completions ("tasks"). start(c) registers a child;
+# the group is "done" (all_done()) once every child Completion is done. The group attaches a
+# Continuation to each child so it learns, via the reactor's normal completion path, when a task
+# finishes — no polling loop, no busy-wait.
+#
+# Fail-fast (the default, like anyio): if any task completes with errored=True, the group cancels
+# its scope, which completes every sibling with errored=True (cancellation == errored completion,
+# the same channel as I/O errors). With fail_fast=False the group simply joins all tasks regardless.
+#
+# Completion detection the reactor can poll: a `done` flag (on the shared _GroupState) flips true
+# when the last task finishes. A test drives reactor.run_forever() and then checks all_done()/done.
+#
+# Type-cycle note (Codon eager annotations): the per-task Continuation must signal the group, but
+# a Continuation<->TaskGroup field cycle would fail to compile. So the Continuation holds a tiny
+# shared `_GroupState` (the _Flag trick from timeout.codon / scope.codon), never the TaskGroup
+# itself; TaskGroup -> _GroupState is one-directional.
+
+from ..reactor import Reactor
+from .streams import Completion, Continuation
+from .scope import CancelScope
+
+
+class _GroupState:
+    """Shared mutable join state, held by BOTH the TaskGroup and every task's Continuation."""
+    total: int
+    finished: int
+    errored_count: int
+    done: bool
+    fail_fast: bool
+    scope: CancelScope
+
+    def __init__(self, scope: CancelScope, fail_fast: bool):
+        self.total = 0
+        self.finished = 0
+        self.errored_count = 0
+        self.done = False
+        self.fail_fast = fail_fast
+        self.scope = scope
+
+    def on_task_finished(self, errored: bool):
+        self.finished += 1
+        if errored:
+            self.errored_count += 1
+            if self.fail_fast and not self.scope.cancelled:
+                # Cancel siblings. Their continuations will then fire here too, but each child
+                # finishes at most once (Completion._complete is a no-op after done), so the
+                # bookkeeping stays correct.
+                self.scope.cancel()
+        if self.finished >= self.total:
+            self.done = True
+
+    def all_done(self) -> bool:
+        return self.total > 0 and self.finished >= self.total
+
+
+class _TaskDone(Continuation):
+    """Attached to each task's Completion; on completion, advances the group's join state."""
+    state: _GroupState
+
+    def __init__(self, state: _GroupState):
+        super().__init__()
+        self.state = state
+
+    def run(self):
+        # self.errored was copied in by Completion._fire just before this call.
+        self.state.on_task_finished(self.errored)
+
+
+class TaskGroup:
+    """A CancelScope owning N child tasks (Completions). Driven explicitly (no `with`-await):
+
+        tg = TaskGroup(r, deadline=2.0)   # deadline<0 (default) means none
+        tg.open()
+        tg.start(sleep(r, 0.01))
+        tg.start(sleep(r, 0.02))
+        ... reactor.run_forever() ...
+        tg.close()
+        assert tg.all_done() and not tg.any_errored()
+    """
+    r: Reactor
+    scope: CancelScope
+    state: _GroupState
+
+    def __init__(self, r: Reactor, deadline: float = -1.0, fail_fast: bool = True):
+        self.r = r
+        self.scope = CancelScope(r, deadline)
+        self.state = _GroupState(self.scope, fail_fast)
+
+    def open(self) -> TaskGroup:
+        """Arm the (optional) deadline. Returns self for chaining."""
+        self.scope.open()
+        return self
+
+    def start(self, c: Completion) -> Completion:
+        """Register a child task. Returns the same Completion for chaining."""
+        self.state.total += 1
+        self.scope.add(c)
+        # Attach the join continuation. If c is already done, then() fires it synchronously now.
+        c.then(_TaskDone(self.state))
+        return c
+
+    def cancel(self):
+        """Manually cancel the group (propagates to all live tasks)."""
+        self.scope.cancel()
+
+    def close(self):
+        """Disarm the deadline timer."""
+        self.scope.close()
+
+    # ---- join / status (reactor-pollable) ----
+    @property
+    def done(self) -> bool:
+        return self.state.done
+
+    def all_done(self) -> bool:
+        return self.state.all_done()
+
+    def any_errored(self) -> bool:
+        return self.state.errored_count > 0
+
+    @property
+    def cancelled(self) -> bool:
+        return self.scope.cancelled
+
+    @property
+    def deadline_expired(self) -> bool:
+        return self.scope.deadline_expired

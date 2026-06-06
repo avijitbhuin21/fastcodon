@@ -1,8 +1,17 @@
 # fastcodon.aio — P32/P33: the async layer built ON the callback reactor.
 #
-# Public API (import from fastcodon.aio.streams / fastcodon.aio.timeout):
-#   streams: Stream, Completion, Continuation, wrap_stream, connect_stream
-#   timeout: Timeout, TimeoutAction, after
+# Public API (import from fastcodon.aio.<module>):
+#   streams:    Stream, Completion, Continuation, wrap_stream, connect_stream
+#   timeout:    Timeout, TimeoutAction, after
+#   sleep:      sleep(r, delay) -> Completion        (the canonical async "task")
+#   scope:      CancelScope                          (deadline + manual cancel; deadline<0 = none)
+#   taskgroup:  TaskGroup                            (a CancelScope owning N child tasks; fail-fast)
+#   sync:       Event, Semaphore                     (reactor-driven, Completion-based)
+#
+# P33 structured concurrency (scope/taskgroup/sync) layers on the Timeout primitive — see
+# timeout.codon's header. There is no `with`-await, so scopes/groups are driven explicitly via
+# open()/start()/add()/close(); cancellation == completing a Completion with errored=True, the
+# SAME channel as I/O errors, so continuations need no separate cancellation path.
 #
 # Design: there is no async/await; an operation returns a `Completion` result-holder that the
 # reactor fills, and callers attach a `Continuation` object (virtual dispatch, since Codon

@@ -28,11 +28,19 @@ interpreter, no Rust `pydantic-core`, no C extension shims). The output is a Cod
 > enc/dec `fastcodon/json/*` (P21), URL/query/cookies/HTTP-dates `fastcodon/urllib/*` (P22), the
 > sans-I/O HTTP/1.1 parser `fastcodon/http/*` (P23), the WebSocket frame codec + handshake
 > `fastcodon/websocket/*` (P24), and the multipart/form-data parser `fastcodon/multipart/*` (P25).
-> **L3 async streams** `fastcodon/aio/*` (P32) is also DONE — buffered read/write with backpressure
-> over the callback reactor (Completion/Continuation objects, since Codon has no `await`), verified
-> with a real loopback echo; a timeout primitive seeds P33. Each component ships a green test in
-> `tests/` (`test_json`, `test_urllib`, `test_http`, `test_websocket`, `test_multipart`,
-> `test_streams`). Whole suite: 10/10 tests pass.
+> **L3 async runtime** `fastcodon/aio/*` is DONE: streams (P32, buffered read/write + backpressure
+> over the callback reactor via Completion/Continuation objects, since Codon has no `await`) and
+> structured concurrency (P33, CancelScope/TaskGroup/Event/Semaphore/sleep on the timer queue).
+> **L4 is underway: the ASGI server core + HTTP/1.1 transport (P41/P42) are DONE** —
+> `fastcodon/asgi/*` accepts connections on the reactor, parses requests via the `http` parser,
+> drives an `ASGIApp.handle(scope, body) -> Response` (buffered v1; streaming receive/send deferred),
+> serializes the response, and does keep-alive. **Milestone hit: a real server serves
+> `{"hello":"world"}` over an actual TCP socket** (`tests/test_server.py`).
+>
+> Each component ships a green test in `tests/`. **Whole suite: 13/13 tests pass**, runtime-verified
+> on Windows real hardware AND the Linux x86_64/arm64 + macOS arm64 CI matrix (macOS x86_64 is
+> gated on the scarce, deprecated Intel runner). A macOS-only non-blocking-connect bug (ENOTCONN)
+> was caught by CI and fixed (`Socket.so_error()` + a `connecting` state in the stream).
 >
 > **Cross-platform verification matrix — runtime-verified on real hardware/CI:**
 > - **Windows** x86_64 — ✔️ JIT + native AOT: TCP echo, selector echo, RFC crypto vectors, a
@@ -91,14 +99,14 @@ the FastAPI feature that requires it, so nothing is built that the graph doesn't
 |-----------|--------|:------:|:-----:|:----:|-------------|
 | Async I/O reactor (Handler-based loop + timers over the Selector) | pure-Codon (`P12`) | ❌ build | `P31` | ✔️ | All async I/O |
 | Async socket streams (read/write coros, backpressure) | pure-Codon (`P31`,`P14`) | ❌ build | `P32` | ✔️ | HTTP/WS transports |
-| anyio-equiv: task groups, cancel scopes, timeouts, memory streams | pure-Codon (`threading`✓) | ❌ build | `P33` | 🔄 | Structured concurrency, Starlette — timeout primitive seeded (`aio/timeout.codon`); task groups/cancel scopes next |
+| anyio-equiv: task groups, cancel scopes, timeouts, memory streams | pure-Codon (`threading`✓) | ❌ build | `P33` | ✔️ | Structured concurrency, Starlette — CancelScope/TaskGroup/Event/Semaphore/sleep on the timer queue (`aio/scope,taskgroup,sync,sleep`) |
 
 ### L4 — Protocol servers (uvicorn-equivalent)
 
 | Component | Source | Status | Phase | Done | Need-it-for |
 |-----------|--------|:------:|:-----:|:----:|-------------|
-| ASGI server core (lifespan, scope/receive/send, shutdown) | pure-Codon (`P32`) | ❌ build | `P41` | ⬜ | Hosting any ASGI app |
-| HTTP transport (parser↔streams, keep-alive, streaming) | pure-Codon (`P23`,`P32`) | ❌ build | `P42` | ⬜ | Serving HTTP |
+| ASGI server core (lifespan, scope/receive/send, shutdown) | pure-Codon (`P32`) | ❌ build | `P41` | ✔️ | Hosting any ASGI app — v1 `ASGIApp.handle(scope,body)->Response` (buffered; streaming send/recv deferred) |
+| HTTP transport (parser↔streams, keep-alive, streaming) | pure-Codon (`P23`,`P32`) | ❌ build | `P42` | ✔️ | Serving HTTP — accept loop + continuation state machine; keep-alive; serves `{"hello":"world"}` |
 | WebSocket transport (upgrade + codec over streams) | pure-Codon (`P24`,`P32`) | ❌ build | `P43` | ⬜ | Serving WS |
 | HTTP/2 | pure-Codon | ❌ build | `P44` | ⬜ | Optional parity (1.x) |
 

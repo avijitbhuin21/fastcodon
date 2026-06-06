@@ -1,0 +1,81 @@
+# fastcodon.aio.sync — P33: reactor-driven sync primitives (Event, Semaphore) on Completion.
+#
+# Both build on the Completion/Continuation model: wait/acquire return a Completion that the
+# primitive completes (success) when the condition is satisfied (set()/release()). No busy-wait —
+# a waiter that can't proceed is parked as a pending Completion and completed later, on the same
+# reactor turn that set()/release() runs on. Multiple waiters are supported (a list of pending
+# Completions). Cancellation, as everywhere, is just completing a pending Completion with
+# errored=True (e.g. by a CancelScope), which a waiter sees through its normal errored path.
+
+from .streams import Completion
+
+
+class Event:
+    """A one-shot latch. wait() returns a Completion that completes when set() is called.
+    Once set, future wait()s complete immediately. Supports many simultaneous waiters."""
+    _set: bool
+    waiters: List[Completion]
+
+    def __init__(self):
+        self._set = False
+        self.waiters = []
+
+    @property
+    def is_set(self) -> bool:
+        return self._set
+
+    def wait(self) -> Completion:
+        """Complete now if already set; otherwise park until set()."""
+        c = Completion()
+        if self._set:
+            c._complete("", 0, False, False)
+        else:
+            self.waiters.append(c)
+        return c
+
+    def set(self):
+        """Latch the event and wake every parked waiter (success)."""
+        if self._set:
+            return
+        self._set = True
+        wake = self.waiters
+        self.waiters = []
+        for c in wake:
+            if not c.done:
+                c._complete("", 0, False, False)
+
+
+class Semaphore:
+    """A counting semaphore. acquire() returns a Completion that completes once a permit is free;
+    release() returns a permit, waking the oldest waiter (FIFO) if any."""
+    permits: int
+    waiters: List[Completion]
+
+    def __init__(self, value: int = 1):
+        self.permits = value
+        self.waiters = []
+
+    @property
+    def value(self) -> int:
+        return self.permits
+
+    def acquire(self) -> Completion:
+        """Take a permit if available (complete now); else park FIFO until release()."""
+        c = Completion()
+        if self.permits > 0:
+            self.permits -= 1
+            c._complete("", 0, False, False)
+        else:
+            self.waiters.append(c)
+        return c
+
+    def release(self):
+        """Return a permit. If a waiter is parked, hand the permit straight to it (FIFO)."""
+        # Skip any waiters that were cancelled (already done) while parked.
+        while len(self.waiters) > 0:
+            c = self.waiters[0]
+            self.waiters = self.waiters[1:]
+            if not c.done:
+                c._complete("", 0, False, False)   # hand the permit directly to this waiter
+                return
+        self.permits += 1

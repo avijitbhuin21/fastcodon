@@ -53,8 +53,11 @@ run_test "urllib (P22)"    test_urllib.py     1
 run_test "http (P23)"      test_http.py       1
 run_test "websocket (P24)" test_websocket.py  1
 run_test "multipart (P25)" test_multipart.py  1
-# --- L3 async streams (real loopback over the reactor) ---
-run_test "streams (P32)"   test_streams.py    1
+# --- L3 async runtime (real loopback over the reactor) ---
+run_test "streams (P32)"     test_streams.py     1
+run_test "concurrency (P33)" test_concurrency.py 1
+# --- L4 protocol server (real HTTP round-trip over loopback) ---
+run_test "asgi server (P41/P42)" test_server.py  1
 # TLS needs system OpenSSL (-lssl -lcrypto) + outbound network; optional in CI.
 run_test "tls (P14)"       test_tls_live.py   0  -l ssl -l crypto
 
