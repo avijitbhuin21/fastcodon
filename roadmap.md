@@ -107,6 +107,7 @@ the FastAPI feature that requires it, so nothing is built that the graph doesn't
 |-----------|--------|:------:|:-----:|:----:|-------------|
 | ASGI server core (lifespan, scope/receive/send, shutdown) | pure-Codon (`P32`) | ❌ build | `P41` | ✔️ | Hosting any ASGI app — v1 `ASGIApp.handle(scope,body)->Response` (buffered; streaming send/recv deferred) |
 | HTTP transport (parser↔streams, keep-alive, streaming) | pure-Codon (`P23`,`P32`) | ❌ build | `P42` | ✔️ | Serving HTTP — accept loop + continuation state machine; keep-alive; serves `{"hello":"world"}` |
+| Streaming ASGI `receive`/`send` (chunked request body in, streamed response out) | pure-Codon (`P42`,`P32`) | ❌ build | `P42b` | ⬜ | Large/streamed payloads — enriches the buffered v1 `handle(scope,body)->Response` contract (the part deferred in `P41`/`P42`) |
 | WebSocket transport (upgrade + codec over streams) | pure-Codon (`P24`,`P32`) | ❌ build | `P43` | ⬜ | Serving WS |
 | HTTP/2 | pure-Codon | ❌ build | `P44` | ⬜ | Optional parity (1.x) |
 
@@ -435,6 +436,11 @@ Each phase builds only on green phases below it. **`PXX` = phase id; verify-befo
   contract, graceful shutdown, signals/config/logging.
 - `P42` **HTTP transport** — wire `P23` parser to `P32` streams: keep-alive, request/response
   streaming, expect-100, timeouts. *Verify:* serve raw ASGI apps; HTTP/1.1 conformance.
+  *(Done as a buffered v1: full request in, one `Response` out. The streaming part is `P42b`.)*
+- `P42b` **Streaming `receive`/`send`** — enrich the v1 server so request bodies stream in (chunked
+  without full buffering) and responses stream out (`StreamingResponse`/`FileResponse`), via
+  continuation-driven body chunks over `P32`. *Verify:* stream a large body both directions without
+  buffering it whole.
 - `P43` **WebSocket transport** — upgrade handshake + `P24` codec over `P32`. *Verify:* echo WS app.
 - `P44` *(later)* **HTTP/2** — optional parity milestone.
 
