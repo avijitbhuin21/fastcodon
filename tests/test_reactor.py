@@ -2,9 +2,15 @@
 # Reactor in a single process. Exercises accept fan-out, per-connection handlers, interest
 # switching (write->read), timers (watchdog), and clean shutdown.
 
+from sys import stderr
 from fastcodon.net.socket import listen_tcp, tcp_socket, Socket
 from fastcodon.net.selector import EV_READ, EV_WRITE
 from fastcodon.reactor import Reactor, IOHandler, TimerCallback
+
+def dbg(*args):
+    # diagnostics on stderr — unbuffered, so they survive a CI watchdog kill (and avoid the
+    # Windows-fork `print(flush=True)` crash).
+    print(*args, file=stderr)
 
 PORT = 8201
 NCLIENTS = 5
@@ -82,7 +88,7 @@ class Client(IOHandler):
         if echo != "":
             assert echo == self.msg, "client got '" + echo + "' want '" + self.msg + "'"
             self.box.done += 1
-            print("client echoed:", echo, "done", self.box.done, "of", self.box.total, flush=True)
+            dbg("client echoed:", echo, "done", self.box.done, "of", self.box.total)
             self.r.unregister(self.fd)
             self.sock.close()
             if self.box.done == self.box.total:
@@ -95,7 +101,7 @@ class Watchdog(TimerCallback):
         self.r = r
         self.box = box
     def run(self):
-        print("WATCHDOG fired; clients done =", self.box.done, flush=True)
+        dbg("WATCHDOG fired; clients done =", self.box.done)
         self.r.stop()
 
 def main():
@@ -114,9 +120,9 @@ def main():
         clients.append(cs)
 
     r.call_later(8.0, Watchdog(r, box))    # safety timeout
-    print("entering run_forever; clients:", NCLIENTS, flush=True)
+    dbg("entering run_forever; clients:", NCLIENTS)
     r.run_forever()
-    print("run_forever returned; done =", box.done, flush=True)
+    dbg("run_forever returned; done =", box.done)
 
     print("clients echoed:", box.done, "/", NCLIENTS)
     assert box.done == NCLIENTS, "not all clients completed"
