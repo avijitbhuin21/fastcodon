@@ -38,7 +38,12 @@ from C import recv(i32, cobj, int, i32) -> int as _p_recv
 from C import setsockopt(i32, i32, i32, cobj, u32) -> i32 as _p_setsockopt
 from C import shutdown(i32, i32) -> i32 as _p_shutdown
 from C import close(i32) -> i32 as _p_close
-from C import fcntl(i32, i32, i32) -> i32 as _p_fcntl
+# fcntl is variadic: `int fcntl(int, int, ...)`. It MUST be declared variadic (`...`), not as a
+# fixed 3-arg function — on the Apple arm64 ABI variadic args are passed on the stack, so a
+# fixed-arity declaration would put the flags arg in a register and fcntl would read garbage
+# (silently failing to set O_NONBLOCK -> sockets stay blocking -> accept/recv hang). x86_64 and
+# Linux arm64 pass varargs in registers, so the bug is Apple-Silicon-specific.
+from C import fcntl(i32, i32, ...) -> i32 as _p_fcntl
 # identical signature on both platforms:
 from C import inet_pton(i32, cobj, cobj) -> i32 as _inet_pton
 

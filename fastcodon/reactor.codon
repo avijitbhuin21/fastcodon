@@ -11,8 +11,6 @@
 from time import monotonic
 from .net.selector import Selector, EV_READ, EV_WRITE
 
-from C import seq_stderr() -> cobj as _stderr_fp
-
 
 class IOHandler:
     """Base class for objects that react to I/O readiness on a registered fd. Override these."""
@@ -138,23 +136,13 @@ class Reactor:
 
     def run_forever(self):
         self.running = True
-        _d = 0
         while self.running and self._has_work():
             timeout = self._next_timeout_ms()
-            if _d < 12:
-                print("[rx] it", _d, "to=", timeout, "h=", len(self.handlers),
-                      "t=", len(self.timers), file=_stderr_fp())
             events = self.sel.select(timeout)
-            if _d < 12:
-                print("[rx]  sel->", len(events), file=_stderr_fp())
-                _d += 1
             for ev in events:
                 if ev.fd not in self.handlers:
                     continue
                 h = self.handlers[ev.fd]
-                if _d <= 12:
-                    print("[rx]  disp fd", ev.fd, "re", ev.revents, "rd", int(ev.readable),
-                          "wr", int(ev.writable), file=_stderr_fp())
                 if ev.errored:
                     h.on_error()
                     continue
@@ -162,8 +150,6 @@ class Reactor:
                     self.handlers[ev.fd].on_readable()
                 if ev.writable and ev.fd in self.handlers:
                     self.handlers[ev.fd].on_writable()
-                if _d <= 12:
-                    print("[rx]  done fd", ev.fd, file=_stderr_fp())
             self._run_due_timers()
 
     def close(self):
