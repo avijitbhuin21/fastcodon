@@ -1,0 +1,55 @@
+# fastcodon.validate.serialize — P53: model -> JsonValue -> JSON string.
+#
+# `model_dump(obj)` converts a model into a JsonValue tree (our dynamic dict-equivalent — the Codon
+# analogue of Pydantic's `model_dump()` returning a dict). `model_dump_json(obj)` serialises that via
+# the json encoder (correct RFC 8259 escaping reused for free). Walks fields with static.vars,
+# recursing into nested models, List[T], and Optional[T].
+
+import internal.static as static
+from ..json import JsonValue, dumps
+from .model import BaseModel
+
+
+def _list_to_jv(v: List[T], T: type) -> JsonValue:
+    items = List[JsonValue]()
+    for e in v:
+        items.append(to_json_value(e))
+    return JsonValue.array(items)
+
+
+def _opt_to_jv(v: Optional[T], T: type) -> JsonValue:
+    if v.__bool__():
+        return to_json_value(v.__val__())   # explicit unwrap to T (don't rely on flow narrowing)
+    return JsonValue.null()
+
+
+def to_json_value(v) -> JsonValue:
+    if isinstance(v, BaseModel):
+        d = Dict[str, JsonValue]()
+        for k, fv in static.vars(v):
+            d[k] = to_json_value(fv)
+        return JsonValue.object(d)
+    elif isinstance(v, List):
+        return _list_to_jv(v)
+    elif isinstance(v, Optional):
+        return _opt_to_jv(v)
+    elif isinstance(v, bool):
+        return JsonValue.from_bool(v)
+    elif isinstance(v, int):
+        return JsonValue.from_int(v)
+    elif isinstance(v, float):
+        return JsonValue.from_float(v)
+    elif isinstance(v, str):
+        return JsonValue.from_str(v)
+    else:
+        return JsonValue.null()
+
+
+def model_dump(obj) -> JsonValue:
+    """The model as a JsonValue tree (Pydantic `model_dump()` analogue; JsonValue is our dict)."""
+    return to_json_value(obj)
+
+
+def model_dump_json(obj) -> str:
+    """The model serialised to a compact JSON string."""
+    return dumps(to_json_value(obj))

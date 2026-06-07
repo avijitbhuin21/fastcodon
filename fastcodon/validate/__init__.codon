@@ -1,0 +1,24 @@
+# fastcodon.validate — L5: a compile-time, Pydantic-shaped validation/serialization layer.
+#
+# Models are plain classes deriving the empty `BaseModel` marker; validators/serializers/schema are
+# generated from the fields at COMPILE TIME via Codon static reflection (native-fast, monomorphic).
+# Codon has no @classmethod and crashes on inherited method dispatch, so the API is free functions:
+#
+#     class User(BaseModel):
+#         id: int
+#         name: str
+#         tags: List[str]
+#         addr: Address                 # nested model
+#         nick: Optional[str]
+#
+#     u, errs = model_validate_json(s, User)   # parse + validate -> (model, errors)
+#     if len(errs) == 0: ...                    # exception-free (see errors.codon for why)
+#     model_dump_json(u)                        # -> JSON string
+#     model_dump(u)                             # -> JsonValue tree (dict-equivalent)
+#     model_json_schema(User)                   # -> JSON Schema string
+#
+from .model import BaseModel
+from .errors import ErrorItem, format_errors, errors_json
+from .core import model_validate, model_validate_json, validate_collect, proto
+from .serialize import model_dump, model_dump_json, to_json_value
+from .schema import model_json_schema, model_json_schema_value

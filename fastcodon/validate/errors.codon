@@ -1,0 +1,38 @@
+# fastcodon.validate.errors — P51/P52: structured validation errors (exception-free).
+#
+# Each failed field yields an ErrorItem(loc, msg, type). The engine ACCUMULATES these and RETURNS
+# them (validation does not raise): Codon's exception unwinding faults on this Windows toolchain
+# (the `seq_exc_filter` Pointer32 relocation bug, in both JIT and AOT), so the whole layer is
+# deliberately exception-free — `model_validate` returns (model, errors). `loc` is a dotted/indexed
+# path ("addr.zip", "tags.2") mirroring Pydantic's error `loc`.
+
+
+class ErrorItem:
+    loc: str        # path to the offending value, e.g. "addr.zip" or "tags.2"
+    msg: str        # human-readable message
+    type: str       # machine error code, e.g. "int_parsing", "missing", "string_type"
+
+    def __init__(self, loc: str, msg: str, type: str):
+        self.loc = loc
+        self.msg = msg
+        self.type = type
+
+
+def format_errors(errs: List[ErrorItem]) -> str:
+    """One line per error: `loc: msg [type]`."""
+    n = len(errs)
+    head = str(n) + (" validation error" if n == 1 else " validation errors")
+    parts = List[str]()
+    parts.append(head)
+    for e in errs:
+        loc = e.loc if e.loc != "" else "__root__"
+        parts.append("  " + loc + ": " + e.msg + " [" + e.type + "]")
+    return "\n".join(parts)
+
+
+def errors_json(errs: List[ErrorItem]) -> str:
+    """Pydantic-shaped error array: [{"loc":"..","msg":"..","type":".."}, ...]."""
+    items = List[str]()
+    for e in errs:
+        items.append('{"loc":"' + e.loc + '","msg":"' + e.msg + '","type":"' + e.type + '"}')
+    return "[" + ",".join(items) + "]"

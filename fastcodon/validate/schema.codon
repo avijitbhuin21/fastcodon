@@ -1,0 +1,78 @@
+# fastcodon.validate.schema — P54: model -> JSON Schema (draft 2020-12 subset), for OpenAPI.
+#
+# Walks a model's fields with static reflection and emits a JSON Schema. Nested models are inlined
+# (valid JSON Schema; $defs/$ref is a later refinement). v1 maps: int->integer, float->number,
+# str->string, bool->boolean, List[T]->array, nested BaseModel->object; non-Optional fields are
+# `required`.
+#
+# IMPORTANT: a prototype built by `proto(T)` has uninitialised reference fields (a nested-model field
+# is a null pointer). So we NEVER dereference a field prototype for a ref type — we recurse via
+# `type(v)` + a FRESH `proto`, mirroring how core.codon's _coerce/_build stay null-safe.
+
+import internal.static as static
+from ..json import JsonValue, dumps
+from .model import BaseModel
+from .core import proto
+
+
+def _t(name: str) -> JsonValue:
+    d = Dict[str, JsonValue]()
+    d["type"] = JsonValue.from_str(name)
+    return JsonValue.object(d)
+
+
+def _schema_list(p: List[T], T: type) -> JsonValue:
+    d = Dict[str, JsonValue]()
+    d["type"] = JsonValue.from_str("array")
+    d["items"] = _field_schema(proto(T))      # fresh prototype of the element type
+    return JsonValue.object(d)
+
+
+def _schema_opt(p: Optional[T], T: type) -> JsonValue:
+    # v1: Optional contributes the inner schema and drops the field from `required`.
+    return _field_schema(proto(T))
+
+
+def _field_schema(v) -> JsonValue:
+    # `v` is a prototype value; for ref types it may be null, so only isinstance/type(v) — no deref.
+    if isinstance(v, BaseModel):
+        return _model_schema(type(v))
+    elif isinstance(v, List):
+        return _schema_list(v)
+    elif isinstance(v, Optional):
+        return _schema_opt(v)
+    elif isinstance(v, bool):
+        return _t("boolean")
+    elif isinstance(v, int):
+        return _t("integer")
+    elif isinstance(v, float):
+        return _t("number")
+    elif isinstance(v, str):
+        return _t("string")
+    else:
+        return JsonValue.object(Dict[str, JsonValue]())
+
+
+def _model_schema(T: type) -> JsonValue:
+    p = proto(T)                              # T.__new__(): a validly-allocated prototype to walk
+    props = Dict[str, JsonValue]()
+    required = List[JsonValue]()
+    for k, v in static.vars(p):
+        props[k] = _field_schema(v)
+        if not isinstance(v, Optional):
+            required.append(JsonValue.from_str(k))
+    d = Dict[str, JsonValue]()
+    d["type"] = JsonValue.from_str("object")
+    d["properties"] = JsonValue.object(props)
+    if len(required) > 0:
+        d["required"] = JsonValue.array(required)
+    return JsonValue.object(d)
+
+
+def model_json_schema_value(T: type) -> JsonValue:
+    return _model_schema(T)
+
+
+def model_json_schema(T: type) -> str:
+    """The model's JSON Schema as a compact JSON string."""
+    return dumps(_model_schema(T))

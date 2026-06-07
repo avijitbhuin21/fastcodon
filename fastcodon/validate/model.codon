@@ -1,0 +1,19 @@
+# fastcodon.validate.model — P51: the BaseModel marker base.
+#
+# A model is just a normal Codon class whose fields carry the schema:
+#
+#     class Address(BaseModel):
+#         city: str
+#         zip: int
+#
+# BaseModel is an EMPTY marker — it tags a class as a validatable model so that (a) the engine can
+# detect a nested-model field via `isinstance(field, BaseModel)`, and (b) the declaration reads like
+# Pydantic (`class User(BaseModel)`). It deliberately has NO methods: Codon crashes (access
+# violation) on inherited *method dispatch* over objects built with `T.__new__()` — which is exactly
+# how the engine constructs models — so all behavior lives in free functions (core/serialize/schema):
+#   model_validate(jv, T) · model_dump(obj) · model_dump_json(obj) · model_json_schema(T)
+# (no @classmethod in Codon, so construction-from-type is a free function rather than a classmethod.)
+
+
+class BaseModel:
+    pass

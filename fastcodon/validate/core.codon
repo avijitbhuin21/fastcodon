@@ -1,0 +1,208 @@
+# fastcodon.validate.core — P51/P52: the compile-time-generated validation engine (exception-free).
+#
+# `static.vars`/`vars_types` (Codon compile-time reflection) let us walk a model's (name, type)
+# fields and emit MONOMORPHIC per-field coercion code — no runtime reflection, no boxing on the
+# happy path. Dispatch is a compile-time `isinstance` chain on a prototype value: each model
+# realization keeps exactly the one branch matching the field type. Recurses into nested BaseModels,
+# List[T], and Optional[T]. Coercion is lax (Pydantic-like: "7" -> 7) for scalars.
+#
+# EXCEPTION-FREE BY DESIGN: Codon's exception unwinding faults on this Windows toolchain, so the
+# engine neither raises nor uses try/except. `model_validate` RETURNS (model, errors). Lax string->
+# number coercion uses hand-rolled non-throwing parsers (not int()/float(), which raise). Every
+# JsonValue accessor is guarded by its `is_*` check so the json layer's own raises never fire.
+#
+# Construction uses `T.__new__()` + per-field `setattr` (the stdlib's __unpickle__ idiom) — which is
+# why BaseModel has no methods (see model.codon): inherited method dispatch over a __new__'d object
+# crashes in Codon, but field access via setattr/static.vars is fine.
+
+import internal.static as static
+from ..json import JsonValue, loads
+from .model import BaseModel
+from .errors import ErrorItem
+
+
+def proto(T: type) -> T:
+    """A prototype value of any type T without invoking a user __init__: scalars/value types
+    default-construct; reference types (models) are raw-allocated (fields set by the caller)."""
+    if isinstance(T, ByVal):
+        return T()
+    else:
+        return T.__new__()
+
+
+# ---- non-throwing scalar parsers (int()/float() raise, which faults here) ------------------
+def _to_int(s: str) -> Tuple[bool, int]:
+    s = s.strip()
+    n = len(s)
+    if n == 0:
+        return (False, 0)
+    i = 0
+    neg = False
+    if s[0] == "-":
+        neg = True
+        i = 1
+    elif s[0] == "+":
+        i = 1
+    if i >= n:
+        return (False, 0)
+    val = 0
+    while i < n:
+        c = ord(s[i])
+        if c < 48 or c > 57:
+            return (False, 0)
+        val = val * 10 + (c - 48)
+        i += 1
+    return (True, -val if neg else val)
+
+
+def _to_float(s: str) -> Tuple[bool, float]:
+    s = s.strip()
+    n = len(s)
+    if n == 0:
+        return (False, 0.0)
+    i = 0
+    neg = False
+    if s[0] == "-":
+        neg = True
+        i = 1
+    elif s[0] == "+":
+        i = 1
+    val = 0.0
+    saw_digit = False
+    while i < n and 48 <= ord(s[i]) <= 57:
+        val = val * 10.0 + float(ord(s[i]) - 48)
+        saw_digit = True
+        i += 1
+    if i < n and s[i] == ".":
+        i += 1
+        scale = 1.0
+        while i < n and 48 <= ord(s[i]) <= 57:
+            scale = scale / 10.0
+            val = val + float(ord(s[i]) - 48) * scale
+            saw_digit = True
+            i += 1
+    if i < n and (s[i] == "e" or s[i] == "E"):
+        i += 1
+        eneg = False
+        if i < n and s[i] == "-":
+            eneg = True
+            i += 1
+        elif i < n and s[i] == "+":
+            i += 1
+        exp = 0
+        saw_exp = False
+        while i < n and 48 <= ord(s[i]) <= 57:
+            exp = exp * 10 + (ord(s[i]) - 48)
+            saw_exp = True
+            i += 1
+        if not saw_exp:
+            return (False, 0.0)
+        p = 1.0
+        k = 0
+        while k < exp:
+            p = p * 10.0
+            k += 1
+        val = val / p if eneg else val * p
+    if i != n or not saw_digit:
+        return (False, 0.0)
+    return (True, -val if neg else val)
+
+
+def _coerce_list(fj: JsonValue, p: List[T], loc: str, errs: List[ErrorItem], T: type) -> List[T]:
+    out = List[T]()
+    if not fj.is_array():
+        errs.append(ErrorItem(loc, "input should be a valid array", "list_type"))
+        return out
+    i = 0
+    for ev in fj.as_list():
+        out.append(_coerce(ev, proto(T), loc + "." + str(i), errs))
+        i += 1
+    return out
+
+
+def _coerce_opt(fj: JsonValue, p: Optional[T], loc: str, errs: List[ErrorItem], T: type) -> Optional[T]:
+    if fj.is_null():
+        return Optional[T]()
+    return Optional[T](_coerce(fj, proto(T), loc, errs))
+
+
+def _coerce(fj: JsonValue, p, loc: str, errs: List[ErrorItem]):
+    # Returns a value of type(p). On a type error, records an ErrorItem and returns the prototype
+    # `p` as a placeholder (discarded by the caller when errs is non-empty).
+    if isinstance(p, BaseModel):
+        return _build(fj, type(p), loc, errs)
+    elif isinstance(p, List):
+        return _coerce_list(fj, p, loc, errs)
+    elif isinstance(p, Optional):
+        return _coerce_opt(fj, p, loc, errs)
+    elif isinstance(p, bool):
+        if fj.is_bool():
+            return fj.as_bool()
+        errs.append(ErrorItem(loc, "input should be a valid boolean", "bool_type"))
+        return p
+    elif isinstance(p, int):
+        if fj.is_int():
+            return fj.as_int()
+        if fj.is_str():
+            ok, iv = _to_int(fj.as_str())
+            if ok:
+                return iv
+        errs.append(ErrorItem(loc, "input should be a valid integer", "int_parsing"))
+        return p
+    elif isinstance(p, float):
+        if fj.is_float() or fj.is_int():
+            return fj.as_float()
+        if fj.is_str():
+            ok, fv = _to_float(fj.as_str())
+            if ok:
+                return fv
+        errs.append(ErrorItem(loc, "input should be a valid number", "float_parsing"))
+        return p
+    elif isinstance(p, str):
+        if fj.is_str():
+            return fj.as_str()
+        errs.append(ErrorItem(loc, "input should be a valid string", "string_type"))
+        return p
+    else:
+        return p
+
+
+def _build(fj: JsonValue, T: type, loc: str, errs: List[ErrorItem]) -> T:
+    obj = T.__new__()
+    if not fj.is_object():
+        errs.append(ErrorItem(loc if loc != "" else "__root__",
+                              "input should be a valid object", "model_type"))
+        return obj
+    d = fj.obj
+    for k, v in static.vars(obj):
+        floc = k if loc == "" else loc + "." + k
+        if k in d:
+            setattr(obj, k, _coerce(d[k], v, floc, errs))
+        elif isinstance(v, Optional):
+            setattr(obj, k, _none(v))         # absent optional -> None
+        else:
+            errs.append(ErrorItem(floc, "field required", "missing"))
+    return obj
+
+
+def _none(p: Optional[T], T: type) -> Optional[T]:
+    return Optional[T]()
+
+
+# ---- public API (exception-free: returns (model, errors)) ---------------------------------
+def model_validate(jv: JsonValue, T: type) -> Tuple[T, List[ErrorItem]]:
+    """Validate a parsed JsonValue into a model T. Returns (model, errors); `errors` is empty on
+    success, else `model` is best-effort/partial. (Does not raise — see module docstring.)"""
+    errs = List[ErrorItem]()
+    obj = _build(jv, T, "", errs)
+    return (obj, errs)
+
+
+def model_validate_json(s: str, T: type) -> Tuple[T, List[ErrorItem]]:
+    """Parse a JSON string and validate it into a model T. Returns (model, errors)."""
+    return model_validate(loads(s), T)
+
+
+# Back-compat alias: validate_collect == model_validate (both return (model, errors)).
+def validate_collect(jv: JsonValue, T: type) -> Tuple[T, List[ErrorItem]]:
+    return model_validate(jv, T)
