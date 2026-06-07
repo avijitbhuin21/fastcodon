@@ -218,3 +218,180 @@ def keep_alive(req: Request) -> bool:
     if conn is not None and conn.lower().find("close") >= 0:
         return False
     return True
+
+
+# --- P42b: incremental streaming parser ----------------------------------------------------------
+# Body framing modes.
+_BODY_NONE: Literal[int] = 0
+_BODY_LENGTH: Literal[int] = 1
+_BODY_CHUNKED: Literal[int] = 2
+# Chunked sub-states (a state machine that tolerates chunks split across feeds — which the
+# buffered _decode_chunked above cannot, since it needs the whole body present at once).
+_CH_SIZE: Literal[int] = 0      # reading the "<hex>;ext\r\n" size line
+_CH_DATA: Literal[int] = 1      # copying `_remaining` chunk-data bytes
+_CH_DCRLF: Literal[int] = 2     # consuming the CRLF after a chunk's data
+_CH_TRAIL: Literal[int] = 3     # consuming the final CRLF after the 0-size chunk
+_CH_DONE: Literal[int] = 4      # body complete
+
+
+class StreamingRequestParser:
+    """Incremental sans-I/O request parser for the streaming transport (P42b). Unlike RequestParser
+    (which returns one fully-buffered Request), this surfaces the header block first, then yields
+    body bytes piecewise so a large body is never buffered whole. Pure primitives + reuses the
+    module helpers, so there is no type cycle. RequestParser (and its P23 tests) are untouched."""
+    _buf: str
+    _headers_done: bool
+    _method: str
+    _target: str
+    _version: str
+    _headers: List[Tuple[str, str]]
+    _body_mode: int
+    _remaining: int                 # bytes left (Content-Length), or current chunk-data left
+    _chunk_state: int
+    _body_done: bool
+    _errored: bool
+
+    def __init__(self):
+        self._buf = ""
+        self._headers_done = False
+        self._method = ""
+        self._target = ""
+        self._version = ""
+        self._headers = List[Tuple[str, str]]()
+        self._body_mode = _BODY_NONE
+        self._remaining = 0
+        self._chunk_state = _CH_SIZE
+        self._body_done = False
+        self._errored = False
+
+    def feed(self, data: str) -> None:
+        """Append received bytes."""
+        self._buf += data
+
+    def headers_ready(self) -> bool:
+        """Parse the request line + headers once the blank-line terminator has arrived, consuming
+        them from the buffer and picking the body framing. Idempotent once done."""
+        if self._headers_done:
+            return True
+        term = self._buf.find(TERM)
+        if term < 0:
+            return False
+        head = self._buf[:term]
+        self._buf = self._buf[term + 4:]          # consume the header block + terminator
+        first_crlf = head.find(CRLF)
+        if first_crlf < 0:
+            request_line = head
+            header_block = ""
+        else:
+            request_line = head[:first_crlf]
+            header_block = head[first_crlf + 2:]
+        (method, target, version) = _parse_request_line(request_line)
+        headers = _parse_headers(header_block)
+        self._method = method
+        self._target = target
+        self._version = version
+        self._headers = headers
+        # Pick body framing (chunked takes precedence over Content-Length, per RFC 7230).
+        te = _header_get(headers, "transfer-encoding")
+        if te is not None and te.lower().find("chunked") >= 0:
+            self._body_mode = _BODY_CHUNKED
+            self._chunk_state = _CH_SIZE
+        else:
+            cl = _header_get(headers, "content-length")
+            if cl is not None:
+                self._body_mode = _BODY_LENGTH
+                self._remaining = int(cl.strip())
+                if self._remaining <= 0:
+                    self._body_done = True
+            else:
+                self._body_mode = _BODY_NONE
+                self._body_done = True
+        self._headers_done = True
+        return True
+
+    def request_head(self) -> Tuple[str, str, str, List[Tuple[str, str]]]:
+        """(method, target, version, headers) — the transport builds the Scope (the parser must not
+        import asgi: layering)."""
+        return (self._method, self._target, self._version, self._headers)
+
+    def errored(self) -> bool:
+        return self._errored
+
+    def leftover(self) -> str:
+        """Bytes buffered past the consumed portion (e.g. pipelined data after the body)."""
+        return self._buf
+
+    def take_body_chunk(self) -> Tuple[str, bool]:
+        """Return (chunk, done): the body bytes decodable from what's currently buffered, and
+        whether the body is now complete. ("" with done=False means 'need more bytes' — only
+        re-call after feed()ing more, else you spin)."""
+        if self._body_done:
+            return ("", True)
+        if self._body_mode == _BODY_LENGTH:
+            avail = len(self._buf)
+            if avail == 0:
+                return ("", False)
+            take = self._remaining if avail >= self._remaining else avail
+            out = self._buf[:take]
+            self._buf = self._buf[take:]
+            self._remaining -= take
+            if self._remaining <= 0:
+                self._body_done = True
+                return (out, True)
+            return (out, False)
+        if self._body_mode == _BODY_CHUNKED:
+            return self._take_chunked()
+        # _BODY_NONE
+        self._body_done = True
+        return ("", True)
+
+    def _take_chunked(self) -> Tuple[str, bool]:
+        out = List[str]()
+        while True:
+            st = self._chunk_state
+            if st == _CH_DONE:
+                self._body_done = True
+                return ("".join(out), True)
+            if st == _CH_SIZE:
+                line_end = self._buf.find(CRLF)
+                if line_end < 0:
+                    return ("".join(out), False)
+                size_line = self._buf[:line_end]
+                semi = size_line.find(";")
+                if semi >= 0:
+                    size_line = size_line[:semi]
+                size_line = size_line.strip()
+                if size_line == "":
+                    self._errored = True
+                    raise ValueError("malformed chunk: empty size")
+                size = _parse_hex(size_line)
+                self._buf = self._buf[line_end + 2:]
+                if size == 0:
+                    self._chunk_state = _CH_TRAIL
+                else:
+                    self._remaining = size
+                    self._chunk_state = _CH_DATA
+            elif st == _CH_DATA:
+                avail = len(self._buf)
+                if avail == 0:
+                    return ("".join(out), False)
+                take = self._remaining if avail >= self._remaining else avail
+                out.append(self._buf[:take])
+                self._buf = self._buf[take:]
+                self._remaining -= take
+                if self._remaining <= 0:
+                    self._chunk_state = _CH_DCRLF
+            elif st == _CH_DCRLF:
+                if len(self._buf) < 2:
+                    return ("".join(out), False)
+                if self._buf[:2] != CRLF:
+                    self._errored = True
+                    raise ValueError("malformed chunk: missing CRLF after data")
+                self._buf = self._buf[2:]
+                self._chunk_state = _CH_SIZE
+            else:  # _CH_TRAIL — consume the final CRLF after the 0-size chunk (no trailer support)
+                line_end = self._buf.find(CRLF)
+                if line_end < 0:
+                    return ("".join(out), False)
+                self._buf = self._buf[line_end + 2:]
+                self._chunk_state = _CH_DONE

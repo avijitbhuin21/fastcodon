@@ -1,0 +1,189 @@
+# fastcodon.asgi.ws_transport — P43: WebSocket transport for ONE upgraded connection.
+#
+# Runs the RFC 6455 read/write loop over a `Stream` as a continuation state machine (no `await`),
+# reusing the P24 frame codec. The HTTP transport (http_transport.codon) detects the Upgrade,
+# performs the handshake, then hands the live Stream to a WebSocketConnection and never touches it
+# again. The application is a `WebSocketEndpoint` (defined in .types, so this module imports it
+# rather than the reverse — http_transport -> ws_transport is one-directional).
+#
+# Codon idioms (see reactor.codon / streams.codon):
+#   * closures don't unify  -> the per-connection callback is a virtual-method class.
+#   * one read + one write in flight per Stream -> every outbound frame (data, PONG, CLOSE) goes
+#     through `wqueue`, drained one at a time; exactly one read is armed at a time.
+#   * eager field/param resolution -> WebSocketConnection is defined BEFORE WSStep (whose `conn`
+#     field names it); WebSocketConnection names WSStep only inside method bodies (lazy).
+
+from ..aio.streams import Stream, Continuation
+from ..websocket import (Frame, encode_frame, decode_frame,
+                         build_close_payload, parse_close_payload,
+                         OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG)
+from .types import WebSocketSender, WebSocketEndpoint
+
+# WSStep kinds — what op just completed, so the continuation knows how to react.
+_WS_READ: Literal[int] = 0
+_WS_WRITE: Literal[int] = 1
+
+
+class WebSocketConnection(WebSocketSender):
+    """Owns one upgraded connection: drives the frame read loop and serializes outbound frames."""
+    stream: Stream
+    endpoint: WebSocketEndpoint
+    rbuf: str                # received bytes not yet decoded into a full frame
+    frag_op: int             # opcode of an in-progress fragmented message
+    frag_buf: str            # accumulated payload of the fragmented message
+    fragmenting: bool
+    wqueue: List[str]        # queued outbound frames (already encoded); head is in flight
+    writing: bool
+    closing: bool            # a CLOSE frame is queued; finish once the queue drains
+    closed: bool
+
+    def __init__(self, stream: Stream, endpoint: WebSocketEndpoint, leftover: str = ""):
+        self.stream = stream
+        self.endpoint = endpoint
+        self.rbuf = leftover
+        self.frag_op = 0
+        self.frag_buf = ""
+        self.fragmenting = False
+        self.wqueue = List[str]()
+        self.writing = False
+        self.closing = False
+        self.closed = False
+
+    def _as_sender(self) -> WebSocketSender:
+        # Upcast self to the base type for virtual endpoint callbacks: Codon's virtual-method thunk
+        # dispatch requires args to match the declared base signature, not the concrete subtype.
+        me: WebSocketSender = self
+        return me
+
+    def start(self):
+        """Fire on_connect, decode any bytes carried over from the handshake read, then arm a read."""
+        self.endpoint.on_connect(self._as_sender())
+        self._drain_frames()
+        if not self.closed:
+            self._issue_read()
+
+    # ---- WebSocketSender API (server frames are unmasked) ----------------------------------
+    def send_text(self, s: str) -> None:
+        self._enqueue(encode_frame(OP_TEXT, s))
+
+    def send_bytes(self, b: str) -> None:
+        self._enqueue(encode_frame(OP_BIN, b))
+
+    def close(self, code: int = 1000) -> None:
+        if self.closing or self.closed:
+            return
+        self.closing = True
+        self._enqueue(encode_frame(OP_CLOSE, build_close_payload(code)))
+
+    # ---- outbound queue (one write in flight) ---------------------------------------------
+    def _enqueue(self, frame: str) -> None:
+        if self.closed:
+            return
+        self.wqueue.append(frame)
+        if not self.writing:
+            self._pump_write()
+
+    def _pump_write(self) -> None:
+        if self.writing or self.closed:
+            return
+        if len(self.wqueue) == 0:
+            if self.closing:
+                self._finish()              # CLOSE has been flushed -> shut the socket
+            return
+        frame = self.wqueue[0]
+        self.writing = True
+        self.stream.write(frame).then(WSStep(self, _WS_WRITE))
+
+    def _on_write_done(self, errored: bool) -> None:
+        self.writing = False
+        if errored:
+            self._finish()
+            return
+        if len(self.wqueue) > 0:
+            self.wqueue = self.wqueue[1:]   # pop the frame we just sent
+        self._pump_write()
+
+    # ---- inbound loop ---------------------------------------------------------------------
+    def _issue_read(self) -> None:
+        if self.closed:
+            return
+        self.stream.read_some().then(WSStep(self, _WS_READ))
+
+    def _on_read(self, data: str, eof: bool, errored: bool) -> None:
+        if errored:
+            self._finish()
+            return
+        if len(data) > 0:
+            self.rbuf += data
+            self._drain_frames()
+        if eof:
+            self._finish()
+            return
+        if not self.closed:
+            self._issue_read()
+
+    def _drain_frames(self) -> None:
+        while not self.closed:
+            res = decode_frame(self.rbuf)
+            if res is None:
+                return                      # need more bytes for the next frame
+            (frame, consumed) = res
+            self.rbuf = self.rbuf[consumed:]
+            self._handle_frame(frame)
+
+    def _handle_frame(self, frame: Frame) -> None:
+        op = frame.opcode
+        if op == OP_PING:
+            self._enqueue(encode_frame(OP_PONG, frame.payload))
+            return
+        if op == OP_PONG:
+            return
+        if op == OP_CLOSE:
+            (code, _reason) = parse_close_payload(frame.payload)
+            self.endpoint.on_close(self._as_sender(), code)
+            if not self.closing and not self.closed:
+                self.closing = True
+                self._enqueue(encode_frame(OP_CLOSE, build_close_payload(code)))
+            return
+        if op == OP_CONT:
+            if not self.fragmenting:
+                return                      # stray continuation; ignore
+            self.frag_buf += frame.payload
+            if frame.fin:
+                msg = self.frag_buf
+                is_text = self.frag_op == OP_TEXT
+                self.fragmenting = False
+                self.frag_buf = ""
+                self.frag_op = 0
+                self.endpoint.on_message(self._as_sender(), msg, is_text)
+            return
+        # OP_TEXT / OP_BIN
+        if frame.fin:
+            self.endpoint.on_message(self._as_sender(), frame.payload, op == OP_TEXT)
+        else:
+            self.fragmenting = True
+            self.frag_op = op
+            self.frag_buf = frame.payload
+
+    def _finish(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.stream.close()
+
+
+class WSStep(Continuation):
+    """The single continuation re-dispatched after each WS stream op. Defined AFTER
+    WebSocketConnection so the `conn` field annotation resolves (eager resolution); the connection
+    references WSStep only in method bodies — same one-directional idiom as ConnStep."""
+    conn: WebSocketConnection
+    kind: int
+    def __init__(self, conn: WebSocketConnection, kind: int):
+        super().__init__()
+        self.conn = conn
+        self.kind = kind
+    def run(self):
+        if self.kind == _WS_READ:
+            self.conn._on_read(self.data, self.eof, self.errored)
+        else:
+            self.conn._on_write_done(self.errored)
