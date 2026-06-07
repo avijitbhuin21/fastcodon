@@ -1,0 +1,46 @@
+# fastcodon.web.applications — P64: the Starlette-equivalent application object.
+#
+# WebApp is the bridge from the L4 ASGI server (which calls ASGIApp.handle(scope, body) -> Response)
+# to the L6 toolkit: it wraps a Router behind a middleware chain. Construct it with a Router and an
+# ordered middleware list (middlewares[0] is outermost), then hand it to `asgi.serve`.
+
+from ..asgi.types import ASGIApp, Scope, Response, WebSocketEndpoint
+from .requests import Request
+from .routing import Router
+from .middleware import RequestHandler, Middleware, build_chain
+
+
+class RouterHandler(RequestHandler):
+    """Adapts a Router into a RequestHandler (the innermost link of the middleware chain)."""
+    router: Router
+
+    def __init__(self, router: Router):
+        self.router = router
+
+    def handle(self, request: Request) -> Response:
+        return self.router.dispatch(request)
+
+
+class WebApp(ASGIApp):
+    """A routed application with a middleware stack. Override nothing — register routes on the
+    Router and pass middlewares in. handle() builds a Request and runs the chain."""
+    router: Router
+    chain: RequestHandler
+
+    def __init__(self, router: Router, middlewares: List[Middleware]):
+        self.router = router
+        self.chain = build_chain(RouterHandler(router), middlewares)
+
+    def handle(self, scope: Scope, body: str) -> Response:
+        return self.chain.handle(Request(scope, body))
+
+    def websocket_endpoint(self, scope: Scope) -> Optional[WebSocketEndpoint]:
+        """Opt into a WebSocket upgrade: the L4 transport calls this on an Upgrade request; we
+        return a fresh endpoint for a matching WS route (or None to refuse). Note: WS connections
+        bypass the HTTP middleware chain (Starlette runs a separate WS middleware stack)."""
+        return self.router.match_ws(scope.path)
+
+
+def web_app(router: Router) -> WebApp:
+    """Convenience: a WebApp with no middleware."""
+    return WebApp(router, List[Middleware]())

@@ -4,5 +4,5 @@
 # dynamic Python objects). `loads` parses str -> JsonValue; `dumps` serialises JsonValue -> str.
 from .value import (JsonValue,
                     NULL, BOOL, INT, FLOAT, STR, ARRAY, OBJECT)
-from .decoder import loads
+from .decoder import loads, try_loads
 from .encoder import dumps

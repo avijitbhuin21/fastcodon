@@ -14,14 +14,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot                       # codon-libraries/
-$home = if ($env:CODON_HOME) { $env:CODON_HOME } else { "C:\codon-dev\codon-next-install" }
+# NB: do NOT use $home — it's a read-only automatic variable in PowerShell (assigning it throws).
+$codonHome = if ($env:CODON_HOME) { $env:CODON_HOME } else { "C:\codon-dev\codon-next-install" }
 $llvm = if ($env:LLVM_BIN)   { $env:LLVM_BIN }   else { "C:\Program Files\LLVM\bin" }
 
-$libdir = Join-Path $home "lib\codon"
+$libdir = Join-Path $codonHome "lib\codon"
 # Codon DLLs and bin first; clang LAST so it cannot shadow Codon's own LLVM DLLs (0xC0000139).
-$env:PATH = "$libdir;$home\bin;$env:PATH;$llvm"
+$env:PATH = "$libdir;$codonHome\bin;$env:PATH;$llvm"
 $env:CODON_PATH = $repo                                        # makes `import fastcodon...` resolve
-$codon = Join-Path $home "bin\codon.exe"
+$codon = Join-Path $codonHome "bin\codon.exe"
 
 # ws2_32 = Winsock (sockets/selector). Add others (ssl/crypto) here as TLS lands.
 $libs = @("-l", "ws2_32")

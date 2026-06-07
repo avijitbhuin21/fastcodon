@@ -1,69 +1,89 @@
 # Codon-FastAPI — Roadmap
 
-**Goal:** Recreate **FastAPI** — to *full feature parity* — in **pure Codon**, so that an
-ASGI-class web framework compiles to native machine code and runs at native speed (no CPython
-interpreter, no Rust `pydantic-core`, no C extension shims). The output is a Codon library
-(`codon-libraries/`) you can `import` to write FastAPI-style apps that build to a standalone binary.
+## Status at a glance
 
-**Locked architectural decisions (2026-06-06):**
+`[x]` done & verified · `[ ]` not started. Bottom-up: each layer stands on the green layer below it.
 
-| Decision | Choice | Consequence for the graph |
-|----------|--------|---------------------------|
-| Concurrency model | **Native async event loop** (real `epoll`/`kqueue`/IOCP + coroutines) | The deepest leaf is an *I/O reactor*, not a thread pool. Highest perf ceiling, hardest bottom layer. |
-| Feature scope | **Full FastAPI parity** | OpenAPI/Swagger UI, WebSockets, background tasks, full dependency injection, security utilities all enter the graph. |
-| Platform | **Cross-platform from day one** | The socket + selector + TLS leaves are abstracted behind a platform shim with Windows *and* POSIX backends built together. |
+**L1 — Native leaves (OS / FFI)** — ✅ done
+- [x] Sockets · I/O selector · crypto (SHA1/256, HMAC, base64) · TLS · async reactor (P11–P14, P31)
+
+**L2 — Pure-Codon codecs** — ✅ done
+- [x] JSON encoder/decoder (P21)
+- [x] URL / query / cookies / HTTP-dates (P22)
+- [x] HTTP/1.1 sans-I/O parser (P23)
+- [x] WebSocket frame codec + handshake (P24)
+- [x] multipart/form-data parser (P25)
+
+**L3 — Async runtime** — ✅ done
+- [x] Async socket streams: read/write, backpressure (P32)
+- [x] Structured concurrency: TaskGroup, CancelScope, Event, Semaphore, sleep, timeout (P33)
+
+**L4 — Protocol servers (uvicorn-equiv)** — ✅ parity-complete (HTTP/2 deferred to 1.x)
+- [x] ASGI server core + HTTP/1.1 transport + keep-alive (P41/P42)
+- [x] Streaming responses out + request bodies in (P42b)
+- [x] WebSocket transport: upgrade + lifecycle endpoint (P43)
+- [ ] HTTP/2 (P44) — **deferred to 1.x** (optional; uvicorn itself has no h2). Borrow nghttp2; prereq = TLS+ALPN wired into the async server
+
+**L5 — Validation / serialization (Pydantic-equiv, compile-time)** — ✅ v1 done (`fastcodon/validate/`)
+- [x] Schema / model layer — `BaseModel` + compile-time field reflection (`static.vars`) (P51)
+- [x] Validation engine — coercion (lax str→num), nested/List/Optional, structured errors (P52)
+- [x] Serializers — `model_dump`/`model_dump_json` (P53)
+- [x] JSON-Schema generation — `model_json_schema` (P54)
+- [ ] *Deferred to L5.1:* field constraints (`gt`/`max_length`/…), field defaults, smart unions, raising API (all need Codon features the toolchain lacks — see note)
+
+**L6 — ASGI toolkit (Starlette-equiv)** — ✅ DONE (`fastcodon/web/` + `fastcodon/compress/`)
+- [x] Datastructures — Headers/MutableHeaders/URL/QueryParams/FormData/UploadFile/State (P61)
+- [x] Requests / Responses — Request(json/json_safe/form/cookies) + PlainText/HTML/JSON/Redirect/Streaming/File (P62)
+- [x] Routing — path compile, converters (int/str/float/path/uuid), Route/Router, Mount, url_for, 404/405 (P63)
+- [x] Middleware — chain + CORS + TrustedHost + GZip + ExceptionMiddleware + WebApp bridge (P64)
+- [x] WS endpoints (WSRoute/factory through L4 ws_transport) + Background tasks + StaticFiles + HTTPException/exc handlers (P65)
+- [x] **L6.1** — pure-Codon GZip codec (`compress/`: CRC32 + fixed-Huffman DEFLATE + LZ77 + gzip, verified by external decompressor), signed-cookie Sessions, non-raising JSON (`try_loads`/`json_safe`)
+- *Verified: 15 web/compress tests green incl. WS-route echo, background tasks, and a gzipped response that decompresses via .NET GZipStream (2850→101 bytes).*
+
+**L7 — FastAPI layer (full parity)** — ⬜ not started
+- [ ] App + APIRouter + decorators `@app.get/post/...` (P71)
+- [ ] Param declaration — Path/Query/Header/Cookie/Body/Form/File (P72)
+- [ ] Dependency Injection — Depends, sub-deps, yield, caching (P73)
+- [ ] OpenAPI generation + Swagger UI + ReDoc (P74)
+- [ ] Security utils — OAuth2/API-key/Basic/Bearer/JWT (P75)
+- [ ] Error model — HTTPException, RequestValidationError→422 (P76)
+- [ ] Test client — in-process ASGI (P77)
+
+**Tooling** — ⬜ not started
+- [ ] Parity test port — FastAPI tutorial apps (P81)
+- [ ] Benchmarks vs CPython uvicorn+FastAPI (P82)
+
+## Overview
+
+**What.** Recreate FastAPI at full feature parity in **pure Codon**, so an ASGI-class web framework
+compiles to a single native binary and runs at native speed — no CPython, no Rust `pydantic-core`, no
+C extension shims. The output is an importable Codon library (`codon-libraries/`).
+
+**How.** A dependency graph built strictly **bottom-up** — every layer stands on a green, tested layer
+beneath it. Locked decisions: a **native async event loop** (real `epoll`/`kqueue`/IOCP, no thread
+pool), **full parity** (OpenAPI, WebSockets, DI, security), **cross-platform** from day one.
+
+**Where we are.** L1–L4 are **done and verified** (Windows + Linux x86_64/arm64 + macOS arm64 CI): a
+real server serves HTTP and WebSockets on its own reactor, streaming both directions. **L5 validation
+v1 is done** — a compile-time, Pydantic-shaped `validate` library (models → coercion + nested/List/
+Optional + structured errors + JSON dump + JSON-Schema), generated from field reflection (native-fast,
+no runtime reflection). **L6 is complete** (`fastcodon/web/` + `fastcodon/compress/`): the full
+Starlette-equivalent — datastructures, Request/Response surface, routing (converters/mounts/url_for),
+the middleware stack (CORS/TrustedHost/GZip/sessions/exception handlers) behind a `WebApp(ASGIApp)`,
+WebSocket routes, background tasks, StaticFiles, and a pure-Codon CRC32+DEFLATE+gzip codec — verified
+end-to-end (a routed app over the real L4 server; a gzipped response that inflates under a standard
+decompressor). What's left: the FastAPI surface (L7) and L5.1 validation polish
+(constraints/defaults/unions). Detailed tracker, dependency graph, and build order below.
 
 ---
 
-## 0. Master checklist — what we need / what we have / what to build
+## Detailed tracker
 
 **Legend:** ✅ have (Codon stdlib, import & use) · ⚠️ partial (exists but needs extension) ·
-❌ build (net-new) · ⬜ not started · 🔄 in progress · ✔️ done+verified
+❌ build (net-new) · ⬜ not started · 🔄 in progress · ✔️ done+verified · ⏸️ deferred (out of current scope)
 
-> **Progress (2026-06-06):** the **L1 native leaves are DONE** — `fastcodon/net/socket.codon`
-> (P11), `fastcodon/net/selector.codon` (P12), `fastcodon/crypto/*` (P13), `fastcodon/tls/*` (P14),
-> and the async reactor `fastcodon/reactor.codon` (P31).
->
-> **The full L2 codec layer is now DONE** (all pure-Codon, JIT-verified green on Windows): JSON
-> enc/dec `fastcodon/json/*` (P21), URL/query/cookies/HTTP-dates `fastcodon/urllib/*` (P22), the
-> sans-I/O HTTP/1.1 parser `fastcodon/http/*` (P23), the WebSocket frame codec + handshake
-> `fastcodon/websocket/*` (P24), and the multipart/form-data parser `fastcodon/multipart/*` (P25).
-> **L3 async runtime** `fastcodon/aio/*` is DONE: streams (P32, buffered read/write + backpressure
-> over the callback reactor via Completion/Continuation objects, since Codon has no `await`) and
-> structured concurrency (P33, CancelScope/TaskGroup/Event/Semaphore/sleep on the timer queue).
-> **L4 is underway: the ASGI server core + HTTP/1.1 transport (P41/P42) are DONE** —
-> `fastcodon/asgi/*` accepts connections on the reactor, parses requests via the `http` parser,
-> drives an `ASGIApp.handle(scope, body) -> Response` (buffered v1; streaming receive/send deferred),
-> serializes the response, and does keep-alive. **Milestone hit: a real server serves
-> `{"hello":"world"}` over an actual TCP socket** (`tests/test_server.py`).
->
-> Each component ships a green test in `tests/`. **Whole suite: 13/13 tests pass**, runtime-verified
-> on Windows real hardware AND the Linux x86_64/arm64 + macOS arm64 CI matrix (macOS x86_64 is
-> gated on the scarce, deprecated Intel runner). A macOS-only non-blocking-connect bug (ENOTCONN)
-> was caught by CI and fixed (`Socket.so_error()` + a `connecting` state in the stream).
->
-> **Cross-platform verification matrix — runtime-verified on real hardware/CI:**
-> - **Windows** x86_64 — ✔️ JIT + native AOT: TCP echo, selector echo, RFC crypto vectors, a
->   5-client async echo server, and a real **TLS 1.3 handshake + HTTPS GET**.
-> - **Linux x86_64** — ✔️ green on CI runner (stock upstream Codon v0.19.6).
-> - **Linux arm64** (glibc) — ✔️ green on CI runner.
-> - **macOS arm64** (Apple Silicon) — ✔️ green on CI runner.
-> - **macOS x86_64** — same code; CI gated on a (scarce, deprecated) Intel runner.
->
-> CI: `.github/workflows/leaves-ci.yml` on `github.com/avijitbhuin21/fastcodon`. Three real bugs
-> that the Windows-only build masked were caught and fixed by running on real Linux/macOS:
-> 1. stock Codon uses `str.ptr`/`.len` (the fork uses `_ptr`/`_len`) → access bytes only via the
->    public `ord()`/`str(ptr,len)` API (`fastcodon/sys/buf.codon`);
-> 2. stock Codon's parser rejects `0o` octal literals → use decimal;
-> 3. **Apple-arm64 variadic ABI:** `fcntl(int,int,...)` passes varargs on the *stack* on Apple
->    Silicon, so a fixed-arity FFI decl put `O_NONBLOCK` in a register → `setblocking()` silently
->    failed → `accept()` blocked and hung the reactor. Fixed by declaring `fcntl` variadic (`...`).
->    (x86_64 and Linux-arm64 pass varargs in registers, so only Apple Silicon was affected.)
->
-> See `codon-libraries/README.md` for the toolchain + how to build/run.
-
-Update the **Done** column as phases go green. The **Need-it-for** column traces each item back to
-the FastAPI feature that requires it, so nothing is built that the graph doesn't actually need.
+The **Done** column flips ✔️ as phases go green; **Need-it-for** traces each item back to the FastAPI
+feature that requires it. (Build/verify history lives in `README.md` and the project memory.)
 
 ### L1 — Native leaves (OS / C-FFI primitives)
 
@@ -107,28 +127,29 @@ the FastAPI feature that requires it, so nothing is built that the graph doesn't
 |-----------|--------|:------:|:-----:|:----:|-------------|
 | ASGI server core (lifespan, scope/receive/send, shutdown) | pure-Codon (`P32`) | ❌ build | `P41` | ✔️ | Hosting any ASGI app — v1 `ASGIApp.handle(scope,body)->Response` (buffered; streaming send/recv deferred) |
 | HTTP transport (parser↔streams, keep-alive, streaming) | pure-Codon (`P23`,`P32`) | ❌ build | `P42` | ✔️ | Serving HTTP — accept loop + continuation state machine; keep-alive; serves `{"hello":"world"}` |
-| Streaming ASGI `receive`/`send` (chunked request body in, streamed response out) | pure-Codon (`P42`,`P32`) | ❌ build | `P42b` | ⬜ | Large/streamed payloads — enriches the buffered v1 `handle(scope,body)->Response` contract (the part deferred in `P41`/`P42`) |
-| WebSocket transport (upgrade + codec over streams) | pure-Codon (`P24`,`P32`) | ❌ build | `P43` | ⬜ | Serving WS |
-| HTTP/2 | pure-Codon | ❌ build | `P44` | ⬜ | Optional parity (1.x) |
+| Streaming ASGI `receive`/`send` (chunked request body in, streamed response out) | pure-Codon (`P42`,`P32`) | ❌ build | `P42b` | ✔️ | Large/streamed payloads — `Response.stream(BodyProducer)`→chunked TE out; `StreamingRequestParser` + pull-based `RequestBody`/`BodyReader`/`Responder` for incremental body in (`wants_stream`/`handle_stream`) |
+| WebSocket transport (upgrade + codec over streams) | pure-Codon (`P24`,`P32`) | ❌ build | `P43` | ✔️ | Serving WS — HTTP `Upgrade` detect→101 handshake→`WebSocketConnection` over streams; lifecycle `WebSocketEndpoint` (`on_connect`/`on_message`/`on_close`) |
+| HTTP/2 | 📦 borrow nghttp2 | ⏸️ deferred | `P44` | ⬜ | **Deferred to 1.x** — optional; uvicorn itself has no h2, and FastAPI parity doesn't need it. When done: borrow **nghttp2** (don't hand-roll HPACK/flow-control) + bridge to ASGI streams. **Prereq:** TLS+ALPN integrated into the async `Stream`/`Server` (today TLS is a standalone client helper only) |
 
 ### L5 — Validation / serialization (Pydantic-equivalent, compile-time core)
 
 | Component | Source | Status | Phase | Done | Need-it-for |
 |-----------|--------|:------:|:-----:|:----:|-------------|
-| Schema/model layer (compile-time field metadata) | pure-Codon (static introspection✓) | ❌ build | `P51` | ⬜ | Models, params, DI |
-| Validation engine (coercion/constraints/unions/nested) | pure-Codon (compile-time) | ❌ build | `P52` | ⬜ | Request validation, 422 errors |
-| Serializers (model → dict/JSON) | pure-Codon (`P21`) | ❌ build | `P53` | ⬜ | `response_model` |
-| JSON-Schema generation | pure-Codon | ❌ build | `P54` | ⬜ | OpenAPI document |
+| Schema/model layer (compile-time field metadata) | pure-Codon (static introspection✓) | ❌ build | `P51` | ✔️ | `fastcodon/validate/model.codon` — `BaseModel` marker; fields walked via `static.vars`/`vars_types` |
+| Validation engine (coercion/constraints/unions/nested) | pure-Codon (compile-time) | ❌ build | `P52` | ✔️ | `core.codon` — lax coercion (str→int/float), nested/List/Optional, structured `(loc,msg,type)` errors. **Exception-free** (returns `(model, errors)` — Codon exc unwinding faults here). *Deferred: constraints, defaults, smart unions* |
+| Serializers (model → dict/JSON) | pure-Codon (`P21`) | ❌ build | `P53` | ✔️ | `serialize.codon` — `model_dump`→`JsonValue`, `model_dump_json`→str |
+| JSON-Schema generation | pure-Codon | ❌ build | `P54` | ✔️ | `schema.codon` — `model_json_schema` (object/properties/required, nested inlined) |
 
 ### L6 — ASGI toolkit (Starlette-equivalent)
 
 | Component | Source | Status | Phase | Done | Need-it-for |
 |-----------|--------|:------:|:-----:|:----:|-------------|
-| Datastructures (`Headers`/`URL`/`QueryParams`/`FormData`/`UploadFile`) | pure-Codon (`P22`,`P25`) | ❌ build | `P61` | ⬜ | Request/response surface |
-| Requests / Responses (JSON/Streaming/File/Redirect) | pure-Codon (`P21`,`P32`) | ❌ build | `P62` | ⬜ | Handler I/O |
-| Routing (path compile, converters, mounts, `url_for`) | pure-Codon (`re`✓,`P22`) | ❌ build | `P63` | ⬜ | Dispatch |
-| Middleware (errors, CORS, GZip, TrustedHost, sessions) | pure-Codon (`P33`) | ❌ build | `P64` | ⬜ | Cross-cutting concerns |
-| WS endpoints / Background tasks / StaticFiles / exc handlers | pure-Codon | ❌ build | `P65` | ⬜ | Parity features |
+| Datastructures (`Headers`/`URL`/`QueryParams`/`FormData`/`UploadFile`) | pure-Codon (`P22`,`P25`) | ❌ build | `P61` | ✔️ | `web/datastructures.codon` — Headers/MutableHeaders (ci-multidict), URL parse/replace, QueryParams, FormData+UploadFile, State |
+| Requests / Responses (JSON/Streaming/File/Redirect) | pure-Codon (`P21`,`P32`) | ❌ build | `P62` | ✔️ | `web/requests.codon` (Request: headers/query/cookies/json/form-urlencoded+multipart) + `web/responses.codon` (plain/html/json/redirect/streaming/file + cookie/header mutators) |
+| Routing (path compile, converters, mounts, `url_for`) | pure-Codon (`re`✓,`P22`) | ❌ build | `P63` | ✔️ | `web/routing.codon` — `compile_path`→anchored regex, converters int/str/float/path/uuid, Endpoint/Route/Router/Mount, 404/405+Allow, HEAD→GET, url_for |
+| Middleware (errors, CORS, GZip, TrustedHost, sessions) | pure-Codon (`P33`) | ❌ build | `P64` | ✔️ | `web/middleware.codon` (RequestHandler/Middleware/_Chain/build_chain; CORS, TrustedHost, GZip, ExceptionMiddleware) + `web/applications.codon` (WebApp(ASGIApp) bridge); sessions in `web/sessions.codon` |
+| WS endpoints / Background tasks / StaticFiles / exc handlers | pure-Codon | ❌ build | `P65` | ✔️ | `web/routing.codon` WSRoute/factory → `match_ws` → L4 ws_transport; `asgi` BackgroundTask + `Response.background` run post-write; `web/staticfiles.codon` (non-raising `fopen` reader, traversal guard); `web/exceptions.codon` `http_error` + ExceptionMiddleware |
+| GZip codec + Sessions + non-raising JSON | pure-Codon (`P13`,`P21`) | ❌ build | `L6.1` | ✔️ | `compress/` (CRC32 + fixed-Huffman DEFLATE + LZ77 + gzip, ext-verified); `web/sessions.codon` (HMAC-signed cookie); `json` `try_loads` + `Request.json_safe` |
 | Templating (Jinja2-equiv) | pure-Codon | ❌ build | `P65` | ⬜ | Optional / late add |
 
 ### L7 — FastAPI layer (full parity)
@@ -235,8 +256,8 @@ These are worth structuring as independent Codon packages from day one (the bott
 them in isolation anyway), valuable to the wider Codon ecosystem on their own:
 
 `json` · `crypto` · `tls` · `http` (parser) · `websocket` · `net`/`asyncnet` (sockets+selector+
-reactor+streams) · `validate` (Pydantic-equivalent) · `urllib`. **→ 8 reusable libraries** fall out
-of this project as a side effect.
+reactor+streams) · `validate` (Pydantic-equivalent) · `urllib` · `compress` (CRC32+DEFLATE+gzip,
+pure-Codon). **→ 9 reusable libraries** fall out of this project as a side effect.
 
 ---
 

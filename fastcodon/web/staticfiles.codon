@@ -1,0 +1,84 @@
+# fastcodon.web.staticfiles — P65: serve files from a directory (Starlette StaticFiles-equivalent).
+#
+# Codon's `open()` RAISES on a missing file, and a raised exception faults this toolchain, so file
+# reads go through a non-raising `fopen` FFI instead (NULL on miss, no throw). Reads are buffered
+# (whole file into memory) — fine for assets; a streaming variant can layer on FileBodyProducer
+# later. Path-traversal is rejected before touching disk.
+
+from ..asgi.types import Response
+from .requests import Request
+from .routing import Endpoint
+from .responses import guess_content_type
+
+from C import fopen(cobj, cobj) -> cobj
+from C import fread(cobj, u64, u64, cobj) -> u64
+from C import fseek(cobj, i64, i32) -> i32
+from C import ftell(cobj) -> i64
+from C import fclose(cobj) -> i32
+
+_SEEK_SET: Literal[int] = 0
+_SEEK_END: Literal[int] = 2
+
+
+def read_file(path: str) -> Tuple[bool, str]:
+    """(ok, contents). ok=False means the file could not be opened (missing/permission). Never
+    raises — safe to call on attacker-supplied paths once they pass `_is_safe_rel`."""
+    fp = fopen(path.c_str(), "rb".c_str())
+    if not fp:
+        return (False, "")
+    fseek(fp, i64(0), i32(_SEEK_END))
+    size = int(ftell(fp))
+    fseek(fp, i64(0), i32(_SEEK_SET))
+    if size <= 0:
+        fclose(fp)
+        return (True, "")
+    buf = Ptr[byte](size)
+    got = int(fread(buf, u64(1), u64(size), fp))
+    fclose(fp)
+    return (True, str(buf, got))
+
+
+def _is_safe_rel(rel: str) -> bool:
+    """Reject absolute paths, NUL bytes, drive letters, and any '..' segment (path traversal)."""
+    if rel == "":
+        return True
+    if rel[0] == "/" or rel[0] == "\\":
+        return False
+    if ":" in rel:                       # Windows drive (C:) or scheme
+        return False
+    if "\x00" in rel:
+        return False
+    norm = rel.replace("\\", "/")
+    for seg in norm.split("/"):
+        if seg == "..":
+            return False
+    return True
+
+
+class StaticFiles(Endpoint):
+    """Serves files under `directory`. Bind it to a catch-all route, e.g.
+    `router.get("/static/{path:path}", StaticFiles("./assets"))`. The matched `path` param (name
+    configurable) is resolved under the directory; "" serves `index` if html=True."""
+    directory: str
+    param: str
+    index: str
+
+    def __init__(self, directory: str, param: str = "path", index: str = "index.html"):
+        d = directory
+        if d.endswith("/") or d.endswith("\\"):
+            d = d[:len(d) - 1]
+        self.directory = d
+        self.param = param
+        self.index = index
+
+    def handle(self, request: Request) -> Response:
+        rel = request.path_param(self.param)
+        if not _is_safe_rel(rel):
+            return Response.plain(404, "Not Found", "text/plain; charset=utf-8")
+        if rel == "" or rel.endswith("/"):
+            rel = rel + self.index
+        full = self.directory + "/" + rel
+        (ok, data) = read_file(full)
+        if not ok:
+            return Response.plain(404, "Not Found", "text/plain; charset=utf-8")
+        return Response.plain(200, data, guess_content_type(rel))

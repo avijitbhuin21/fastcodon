@@ -1,0 +1,157 @@
+# fastcodon.web.requests — P62: the Starlette-equivalent Request.
+#
+# A buffered view over the asgi `Scope` plus the fully-read request `body` (matching the buffered
+# ASGIApp.handle contract). Lazily exposes Headers / QueryParams / cookies / JSON / form. Exception-
+# free EXCEPT json(), which delegates to the JSON decoder (raises on malformed input — a known
+# toolchain limitation; clients sending valid JSON never hit it).
+
+from ..asgi.types import Scope
+from ..json.value import JsonValue
+from ..json.decoder import loads, try_loads
+from ..urllib.cookies import parse_cookie
+from ..urllib.querystring import parse_qsl
+from ..multipart.parser import parse_multipart, Part
+from .datastructures import Headers, QueryParams, URL, FormData, UploadFile
+
+
+def _content_type_param(ct: str, key: str) -> str:
+    """Pull a parameter (e.g. boundary, charset) out of a Content-Type value. "" if absent."""
+    parts = ct.split(";")
+    target = key.lower()
+    for raw in parts:
+        seg = raw.strip()
+        eq = seg.find("=")
+        if eq < 0:
+            continue
+        k = seg[:eq].strip().lower()
+        if k == target:
+            v = seg[eq + 1:].strip()
+            if len(v) >= 2 and v[0] == '"' and v[len(v) - 1] == '"':
+                v = v[1:len(v) - 1]
+            return v
+    return ""
+
+
+def _content_type_main(ct: str) -> str:
+    """The media type without parameters, lowercased: 'application/json; x=y' -> 'application/json'."""
+    semi = ct.find(";")
+    base = ct if semi < 0 else ct[:semi]
+    return base.strip().lower()
+
+
+class Request:
+    """One buffered HTTP request. `path_params` is populated by the router on a match."""
+    scope: Scope
+    _body: str
+    path_params: Dict[str, str]
+    session: Dict[str, str]          # populated by SessionMiddleware; mutate to persist
+
+    def __init__(self, scope: Scope, body: str):
+        self.scope = scope
+        self._body = body
+        self.path_params = Dict[str, str]()
+        self.session = Dict[str, str]()
+
+    # ---- basics ----
+    def method(self) -> str:
+        return self.scope.method
+
+    def path(self) -> str:
+        return self.scope.path
+
+    def query_string(self) -> str:
+        return self.scope.query_string
+
+    def headers(self) -> Headers:
+        return Headers(self.scope.headers)
+
+    def query_params(self) -> QueryParams:
+        return QueryParams(self.scope.query_string)
+
+    def header(self, name: str, default: str = "") -> str:
+        v = self.scope.get(name)
+        return v if v is not None else default
+
+    def url(self) -> URL:
+        host = ""
+        hv = self.scope.get("host")
+        if hv is not None:
+            host = hv
+        port = -1
+        colon = host.rfind(":")
+        if colon >= 0:
+            hostname = host[:colon]
+            p = host[colon + 1:]
+            host = hostname
+            port = _to_int(p)
+        return URL("http", host, port, self.scope.path, self.scope.query_string, "")
+
+    def path_param(self, name: str, default: str = "") -> str:
+        if name in self.path_params:
+            return self.path_params[name]
+        return default
+
+    # ---- body ----
+    def body(self) -> str:
+        return self._body
+
+    def text(self) -> str:
+        return self._body
+
+    def json(self) -> JsonValue:
+        """Parse the body as JSON. NOTE: raises on malformed input — prefer json_safe() for
+        untrusted bodies (a raised exception faults this toolchain)."""
+        return loads(self._body)
+
+    def json_safe(self) -> Tuple[bool, JsonValue]:
+        """Parse the body as JSON WITHOUT raising: (ok, value). ok=False on malformed input (value
+        is null). This is the safe entry point for request bodies."""
+        return try_loads(self._body)
+
+    def cookies(self) -> Dict[str, str]:
+        c = self.scope.get("cookie")
+        if c is None:
+            return Dict[str, str]()
+        return parse_cookie(c)
+
+    def content_type(self) -> str:
+        ct = self.scope.get("content-type")
+        return ct if ct is not None else ""
+
+    def form(self) -> FormData:
+        """Parse the body as a form. Supports application/x-www-form-urlencoded and
+        multipart/form-data; any other content type yields an empty FormData."""
+        fd = FormData()
+        ct = self.content_type()
+        main = _content_type_main(ct)
+        if main == "application/x-www-form-urlencoded":
+            for (k, v) in parse_qsl(self._body):
+                fd.add_field(k, v)
+            return fd
+        if main == "multipart/form-data":
+            boundary = _content_type_param(ct, "boundary")
+            if boundary == "":
+                return fd
+            parts = parse_multipart(self._body, boundary)
+            for p in parts:
+                fn = p.filename
+                if fn is not None:
+                    ctype = p.content_type
+                    ctv = ctype if ctype is not None else "application/octet-stream"
+                    fd.add_file(p.name, UploadFile(fn, ctv, p.headers, p.data))
+                else:
+                    fd.add_field(p.name, p.data)
+            return fd
+        return fd
+
+
+def _to_int(s: str) -> int:
+    if len(s) == 0:
+        return -1
+    val = 0
+    for i in range(len(s)):
+        c = ord(s[i])
+        if c < 48 or c > 57:
+            return -1
+        val = val * 10 + (c - 48)
+    return val

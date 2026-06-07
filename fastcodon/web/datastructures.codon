@@ -1,0 +1,403 @@
+# fastcodon.web.datastructures — P61: the Starlette-equivalent request/response value types.
+#
+# Pure Codon, sans-I/O, EXCEPTION-FREE at runtime (this toolchain faults on raised-and-unwound
+# exceptions even in AOT — see the validate layer). Every lookup returns a default/Optional instead
+# of raising. These wrap the already-built L2 codecs (urllib query/cookies) rather than re-parsing.
+#
+# Provided: Headers / MutableHeaders (case-insensitive multidict), URL (parsed components),
+# QueryParams, UploadFile, FormData, State (a typed string bag — Codon has no dynamic attributes).
+
+from ..urllib.querystring import parse_qsl
+from ..urllib.url import unquote
+
+
+class Headers:
+    """Immutable, case-insensitive multi-dict over an ordered (name, value) list. Original order
+    and casing are preserved in `raw`; lookups compare lowercased names."""
+    _list: List[Tuple[str, str]]
+
+    def __init__(self, items: List[Tuple[str, str]]):
+        self._list = items
+
+    @staticmethod
+    def empty() -> Headers:
+        return Headers(List[Tuple[str, str]]())
+
+    def get(self, name: str, default: str = "") -> str:
+        """First value for `name`, or `default` if absent."""
+        key = name.lower()
+        for (k, v) in self._list:
+            if k.lower() == key:
+                return v
+        return default
+
+    def get_optional(self, name: str) -> Optional[str]:
+        # Explicit Optional construction (not a bare `return v`/`return None`): Headers is
+        # polymorphic (MutableHeaders subclasses it), so this method is realized as a vtable thunk
+        # where Codon does NOT auto-wrap a `str` return into `Optional[str]`.
+        key = name.lower()
+        for (k, v) in self._list:
+            if k.lower() == key:
+                return Optional[str](v)
+        return Optional[str]()
+
+    def get_all(self, name: str) -> List[str]:
+        """Every value for `name`, in order."""
+        key = name.lower()
+        out = List[str]()
+        for (k, v) in self._list:
+            if k.lower() == key:
+                out.append(v)
+        return out
+
+    def contains(self, name: str) -> bool:
+        key = name.lower()
+        for (k, v) in self._list:
+            if k.lower() == key:
+                return True
+        return False
+
+    def __contains__(self, name: str) -> bool:
+        return self.contains(name)
+
+    def __getitem__(self, name: str) -> str:
+        return self.get(name)
+
+    def items(self) -> List[Tuple[str, str]]:
+        return self._list
+
+    def keys(self) -> List[str]:
+        out = List[str]()
+        for (k, v) in self._list:
+            out.append(k)
+        return out
+
+    def values(self) -> List[str]:
+        out = List[str]()
+        for (k, v) in self._list:
+            out.append(v)
+        return out
+
+    def __len__(self) -> int:
+        return len(self._list)
+
+    def raw(self) -> List[Tuple[str, str]]:
+        return self._list
+
+
+class MutableHeaders(Headers):
+    """Headers with in-place mutation: set (replace all), append (add), delete, setdefault."""
+
+    def __init__(self, items: List[Tuple[str, str]]):
+        super().__init__(items)
+
+    @staticmethod
+    def new() -> MutableHeaders:
+        return MutableHeaders(List[Tuple[str, str]]())
+
+    def append(self, name: str, value: str) -> None:
+        self._list.append((name, value))
+
+    def set(self, name: str, value: str) -> None:
+        """Replace every existing occurrence of `name` with a single (name, value)."""
+        key = name.lower()
+        out = List[Tuple[str, str]]()
+        placed = False
+        for (k, v) in self._list:
+            if k.lower() == key:
+                if not placed:
+                    out.append((name, value))
+                    placed = True
+                # drop other occurrences
+            else:
+                out.append((k, v))
+        if not placed:
+            out.append((name, value))
+        self._set_list(out)
+
+    def setdefault(self, name: str, value: str) -> str:
+        """If `name` is absent, append (name, value); return the effective first value."""
+        existing = self.get_optional(name)
+        if existing is not None:
+            return existing
+        self._list.append((name, value))
+        return value
+
+    def delete(self, name: str) -> None:
+        key = name.lower()
+        out = List[Tuple[str, str]]()
+        for (k, v) in self._list:
+            if k.lower() != key:
+                out.append((k, v))
+        self._set_list(out)
+
+    def _set_list(self, items: List[Tuple[str, str]]) -> None:
+        # rebuild in place so the underlying list reference stays consistent
+        self._list.clear()
+        for it in items:
+            self._list.append(it)
+
+
+class QueryParams:
+    """Immutable multi-dict over a query string (already percent-decoded by parse_qsl)."""
+    _list: List[Tuple[str, str]]
+
+    def __init__(self, query_string: str):
+        self._list = parse_qsl(query_string)
+
+    @staticmethod
+    def from_pairs(pairs: List[Tuple[str, str]]) -> QueryParams:
+        q = QueryParams("")
+        q._list = pairs
+        return q
+
+    def get(self, key: str, default: str = "") -> str:
+        for (k, v) in self._list:
+            if k == key:
+                return v
+        return default
+
+    def get_optional(self, key: str) -> Optional[str]:
+        for (k, v) in self._list:
+            if k == key:
+                return v
+        return None
+
+    def get_list(self, key: str) -> List[str]:
+        out = List[str]()
+        for (k, v) in self._list:
+            if k == key:
+                out.append(v)
+        return out
+
+    def contains(self, key: str) -> bool:
+        for (k, v) in self._list:
+            if k == key:
+                return True
+        return False
+
+    def __contains__(self, key: str) -> bool:
+        return self.contains(key)
+
+    def __getitem__(self, key: str) -> str:
+        return self.get(key)
+
+    def items(self) -> List[Tuple[str, str]]:
+        return self._list
+
+    def __len__(self) -> int:
+        return len(self._list)
+
+
+class UploadFile:
+    """An uploaded file part (in-memory). `data` holds the raw bytes (Codon str is byte-indexed)."""
+    filename: str
+    content_type: str
+    headers: List[Tuple[str, str]]
+    data: str
+
+    def __init__(self, filename: str, content_type: str,
+                 headers: List[Tuple[str, str]], data: str):
+        self.filename = filename
+        self.content_type = content_type
+        self.headers = headers
+        self.data = data
+
+    def read(self) -> str:
+        return self.data
+
+    def size(self) -> int:
+        return len(self.data)
+
+
+class FormData:
+    """Parsed form: scalar fields plus uploaded files, both keyed and order-preserving."""
+    _fields: List[Tuple[str, str]]
+    _files: List[Tuple[str, UploadFile]]
+
+    def __init__(self):
+        self._fields = List[Tuple[str, str]]()
+        self._files = List[Tuple[str, UploadFile]]()
+
+    def add_field(self, name: str, value: str) -> None:
+        self._fields.append((name, value))
+
+    def add_file(self, name: str, f: UploadFile) -> None:
+        self._files.append((name, f))
+
+    def get(self, key: str, default: str = "") -> str:
+        for (k, v) in self._fields:
+            if k == key:
+                return v
+        return default
+
+    def get_optional(self, key: str) -> Optional[str]:
+        for (k, v) in self._fields:
+            if k == key:
+                return v
+        return None
+
+    def get_list(self, key: str) -> List[str]:
+        out = List[str]()
+        for (k, v) in self._fields:
+            if k == key:
+                out.append(v)
+        return out
+
+    def get_file(self, key: str) -> Optional[UploadFile]:
+        for (k, f) in self._files:
+            if k == key:
+                return f
+        return None
+
+    def contains(self, key: str) -> bool:
+        for (k, v) in self._fields:
+            if k == key:
+                return True
+        for (k, f) in self._files:
+            if k == key:
+                return True
+        return False
+
+    def __contains__(self, key: str) -> bool:
+        return self.contains(key)
+
+    def fields(self) -> List[Tuple[str, str]]:
+        return self._fields
+
+    def files(self) -> List[Tuple[str, UploadFile]]:
+        return self._files
+
+
+class URL:
+    """A parsed URL. Components are split sans-I/O; `query`/`path` are kept raw (percent-encoded).
+    For server requests the meaningful parts are `path` + `query`; absolute-URL parts (scheme/host/
+    port) are filled when a full URL is parsed (e.g. a redirect target)."""
+    scheme: str
+    host: str
+    port: int            # -1 when unspecified
+    path: str
+    query: str
+    fragment: str
+
+    def __init__(self, scheme: str = "", host: str = "", port: int = -1,
+                 path: str = "", query: str = "", fragment: str = ""):
+        self.scheme = scheme
+        self.host = host
+        self.port = port
+        self.path = path
+        self.query = query
+        self.fragment = fragment
+
+    @staticmethod
+    def parse(url: str) -> URL:
+        s = url
+        scheme = ""
+        host = ""
+        port = -1
+        # scheme://
+        sep = s.find("://")
+        rest = s
+        if sep >= 0:
+            scheme = s[:sep].lower()
+            rest = s[sep + 3:]
+            # authority is up to the next '/', '?' or '#'
+            auth_end = len(rest)
+            for i in range(len(rest)):
+                c = rest[i]
+                if c == "/" or c == "?" or c == "#":
+                    auth_end = i
+                    break
+            authority = rest[:auth_end]
+            rest = rest[auth_end:]
+            # strip userinfo
+            at = authority.find("@")
+            if at >= 0:
+                authority = authority[at + 1:]
+            colon = authority.rfind(":")
+            if colon >= 0:
+                host = authority[:colon]
+                portstr = authority[colon + 1:]
+                port = _to_int(portstr, -1)
+            else:
+                host = authority
+        # fragment
+        frag = ""
+        h = rest.find("#")
+        if h >= 0:
+            frag = rest[h + 1:]
+            rest = rest[:h]
+        # query
+        query = ""
+        q = rest.find("?")
+        if q >= 0:
+            query = rest[q + 1:]
+            rest = rest[:q]
+        path = rest
+        return URL(scheme, host, port, path, query, frag)
+
+    def replace(self, scheme: str = "\x00", host: str = "\x00", port: int = -2,
+                path: str = "\x00", query: str = "\x00", fragment: str = "\x00") -> URL:
+        """Return a copy with selected components overridden. The \x00 / -2 sentinels mean 'keep'."""
+        return URL(
+            self.scheme if scheme == "\x00" else scheme,
+            self.host if host == "\x00" else host,
+            self.port if port == -2 else port,
+            self.path if path == "\x00" else path,
+            self.query if query == "\x00" else query,
+            self.fragment if fragment == "\x00" else fragment,
+        )
+
+    def __str__(self) -> str:
+        out = List[str]()
+        if self.scheme != "":
+            out.append(self.scheme)
+            out.append("://")
+            out.append(self.host)
+            if self.port >= 0:
+                out.append(":")
+                out.append(str(self.port))
+        out.append(self.path)
+        if self.query != "":
+            out.append("?")
+            out.append(self.query)
+        if self.fragment != "":
+            out.append("#")
+            out.append(self.fragment)
+        return "".join(out)
+
+
+def _to_int(s: str, default: int) -> int:
+    if len(s) == 0:
+        return default
+    val = 0
+    for i in range(len(s)):
+        c = ord(s[i])
+        if c < 48 or c > 57:
+            return default
+        val = val * 10 + (c - 48)
+    return val
+
+
+class State:
+    """A per-request/app string attribute bag. Starlette's `State` allows arbitrary attributes;
+    Codon has no dynamic attributes, so this is a typed string map (the common case — request ids,
+    user ids, flags). Store richer objects in app-specific typed fields instead."""
+    _d: Dict[str, str]
+
+    def __init__(self):
+        self._d = Dict[str, str]()
+
+    def set(self, key: str, value: str) -> None:
+        self._d[key] = value
+
+    def get(self, key: str, default: str = "") -> str:
+        if key in self._d:
+            return self._d[key]
+        return default
+
+    def contains(self, key: str) -> bool:
+        return key in self._d
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._d

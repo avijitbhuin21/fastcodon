@@ -56,16 +56,68 @@ def scope_from_request(req: Request) -> Scope:
     return Scope("http", req.method, path, query, req.http_version, req.headers)
 
 
+class BodyProducer:
+    """P42b: a pull-based response body source. Override next_chunk(): return the next chunk of
+    body bytes, or "" to signal end-of-body. The transport calls it repeatedly and writes each
+    non-empty return as one HTTP/1.1 chunk (Transfer-Encoding: chunked). Closures don't unify in
+    Codon, so this is a virtual-method base class (same idiom as IOHandler/Continuation)."""
+    def next_chunk(self) -> str:
+        return ""
+
+
+class FileBodyProducer(BodyProducer):
+    """Streams a file in fixed-size blocks — a FileResponse body source. Opened eagerly; each
+    next_chunk() reads one block, returning "" (and closing) at EOF."""
+    block: int
+    _f: File
+    _eof: bool
+
+    def __init__(self, path: str, block: int = 65536):
+        self.block = block
+        self._f = open(path, "rb")
+        self._eof = False
+
+    def next_chunk(self) -> str:
+        if self._eof:
+            return ""
+        data = self._f.read(self.block)
+        if len(data) == 0:
+            self._eof = True
+            self._f.close()
+            return ""
+        return data
+
+
+class BackgroundTask:
+    """P65: work to run AFTER the response has been written to the socket (Starlette BackgroundTask
+    equivalent). Override run(). Closures don't unify in Codon, so this is a virtual-method base;
+    attach instances to a Response via add_task(), and the HTTP transport runs them post-write."""
+    def run(self) -> None:
+        pass
+
+
 class Response:
-    """A buffered HTTP response: status line + headers + a fully-materialized body."""
+    """An HTTP response. Buffered by default (a fully-materialized `body`); if `producer` is set
+    the body is streamed chunk-by-chunk instead (P42b) and `body` is ignored. `background` holds
+    tasks the transport runs once the response is fully written."""
     status: int
     headers: List[Tuple[str, str]]
     body: str
+    producer: Optional[BodyProducer]      # None => buffered `body`; set => chunked stream
+    background: List[BackgroundTask]
 
-    def __init__(self, status: int, headers: List[Tuple[str, str]], body: str):
+    def __init__(self, status: int, headers: List[Tuple[str, str]], body: str,
+                 producer: Optional[BodyProducer] = None):
         self.status = status
         self.headers = headers
         self.body = body
+        self.producer = producer
+        self.background = List[BackgroundTask]()
+
+    def add_task(self, task: BackgroundTask) -> Response:
+        """Queue a background task; returns self for chaining."""
+        self.background.append(task)
+        return self
 
     @staticmethod
     def plain(status: int, body: str, content_type: str) -> Response:
@@ -84,10 +136,99 @@ class Response:
         """`obj_str` is an already-serialized JSON string."""
         return Response.plain(status, obj_str, "application/json")
 
+    @staticmethod
+    def stream(producer: BodyProducer, status: int = 200,
+               content_type: str = "application/octet-stream") -> Response:
+        """A streamed response: the transport pulls `producer.next_chunk()` and writes each chunk
+        with Transfer-Encoding: chunked (no Content-Length). `body` is unused on this path."""
+        h = List[Tuple[str, str]]()
+        h.append(("Content-Type", content_type))
+        return Response(status, h, "", producer)
+
+
+class BodyReader:
+    """P42b receive callback: the app subclasses this and overrides on_chunk(); the transport fills
+    these primitive fields just before each call:
+        data    — the next decoded request-body chunk
+        done    — the body is fully consumed (this is the final on_chunk)
+        errored — the body read failed (I/O error / EOF mid-body)
+    Primitive-only on purpose (like Continuation) so RequestBody<->BodyReader is not an eager type
+    cycle. Pull strictly serially: issue the next read_chunk only from inside the prior on_chunk."""
+    data: str
+    done: bool
+    errored: bool
+    def __init__(self):
+        self.data = ""
+        self.done = False
+        self.errored = False
+    def on_chunk(self):
+        pass
+
+
+class RequestBody:
+    """The streaming request-body channel handed to a streaming app. read_chunk(reader) arranges
+    for reader.on_chunk() to fire exactly once when the next chunk (or done/error) is ready. The
+    concrete implementation lives in the transport; this base names only BodyReader (no transport
+    type) so types.codon stays transport-free and cycle-free."""
+    def read_chunk(self, reader: BodyReader) -> None:
+        pass
+
+
+class Responder:
+    """The send-side handed to a streaming app: call respond(resp) exactly once after draining the
+    request body. `resp` may be buffered or a streamed Response.stream(producer)."""
+    def respond(self, resp: Response) -> None:
+        pass
+
+
+class WebSocketSender:
+    """P43: what a WebSocket application sees as `ws` — the capability to send frames and close.
+    A minimal abstract base with NO stream/frame dependency, defined here (not in ws_transport) so
+    that WebSocketEndpoint's method params and ASGIApp.websocket_endpoint can name it without any
+    module cycle. The concrete WebSocketConnection (in ws_transport) subclasses this."""
+    def send_text(self, s: str) -> None:
+        pass
+    def send_bytes(self, b: str) -> None:
+        pass
+    def close(self, code: int = 1000) -> None:
+        pass
+
+
+class WebSocketEndpoint:
+    """P43 per-connection lifecycle handler. Subclass and override; one instance per connection.
+    `ws` is a WebSocketSender (virtual dispatch reaches the real WebSocketConnection)."""
+    def on_connect(self, ws: WebSocketSender) -> None:
+        pass
+    def on_message(self, ws: WebSocketSender, data: str, is_text: bool) -> None:
+        pass
+    def on_close(self, ws: WebSocketSender, code: int) -> None:
+        pass
+
 
 class ASGIApp:
-    """v1 application base class. Override `handle`: full request (scope + buffered body) in, one
-    Response out. Virtual dispatch (closures don't unify in Codon). Streaming receive/send channels
-    are a deferred enrichment of this contract (see module docstring)."""
+    """Application base class. Override `handle`: full request (scope + buffered body) in, one
+    Response out — the buffered v1 contract the FastAPI layer builds on. Virtual dispatch (closures
+    don't unify in Codon).
+
+    P42b streaming (additive, opt-in): override wants_stream(scope)->True and handle_stream(...) to
+    consume the request body incrementally (pull via body.read_chunk) and answer via
+    responder.respond(...). handle_stream returns nothing because the body is drained asynchronously
+    across continuations, so a synchronous Response return is impossible; the app responds *after*
+    receiving (receive uses the read channel, the response uses the write channel — never both at
+    once, which also satisfies the Stream's one-read/one-write-in-flight rule)."""
     def handle(self, scope: Scope, body: str) -> Response:
         return Response.text("Not Implemented", status=501)
+
+    def wants_stream(self, scope: Scope) -> bool:
+        """Return True to take the streaming path (handle_stream) for this request."""
+        return False
+
+    def handle_stream(self, scope: Scope, body: RequestBody, responder: Responder) -> None:
+        """Streaming entry point. Default drains nothing and answers 501; streaming apps override."""
+        responder.respond(Response.text("Not Implemented", status=501))
+
+    def websocket_endpoint(self, scope: Scope) -> Optional[WebSocketEndpoint]:
+        """P43: return a fresh per-connection WebSocketEndpoint to accept a WebSocket upgrade on
+        this path, or None to refuse (the default). Overriding this is how an app opts into WS —
+        no isinstance/downcast needed; every app answers this, WS apps just return non-None."""
+        return None

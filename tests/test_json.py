@@ -1,5 +1,5 @@
 # P21 JSON leaf — verify the RFC 8259 encoder + decoder against vectors and round-trips.
-from fastcodon.json import (JsonValue, loads, dumps,
+from fastcodon.json import (JsonValue, loads, try_loads, dumps,
                             NULL, BOOL, INT, FLOAT, STR, ARRAY, OBJECT)
 
 def check(name: str, cond: bool):
@@ -98,27 +98,14 @@ def main():
     check("roundtrip s==hiA", rt["s"].as_str() == "hiA")
     check("roundtrip b len 3", len(rt["b"]) == 3)
 
-    # ---- malformed input raises ----
-    threw = False
-    try:
-        loads('{"a":}')
-    except ValueError:
-        threw = True
-    check("malformed object raises", threw)
-
-    threw2 = False
-    try:
-        loads("[1,2")
-    except ValueError:
-        threw2 = True
-    check("unterminated array raises", threw2)
-
-    threw3 = False
-    try:
-        loads("nul")
-    except ValueError:
-        threw3 = True
-    check("bad literal raises", threw3)
+    # ---- malformed input -> try_loads reports failure (exception-free; raised exceptions fault
+    #      this toolchain, so we test the non-raising path rather than `loads` raising) ----
+    (ok_m, _vm) = try_loads('{"a":}')
+    check("malformed object fails", not ok_m)
+    (ok_u, _vu) = try_loads("[1,2")
+    check("unterminated array fails", not ok_u)
+    (ok_l, _vl) = try_loads("nul")
+    check("bad literal fails", not ok_l)
 
     print("PASS: all json vectors match")
 

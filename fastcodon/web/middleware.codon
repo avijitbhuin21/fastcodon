@@ -1,0 +1,206 @@
+# fastcodon.web.middleware — P64: pure-Codon ASGI-style middleware stack (Starlette-equivalent).
+#
+# Closures don't unify in Codon, so the chain is built from virtual-method objects, not callables:
+#   * RequestHandler — the "app" / "next" link: handle(request) -> Response
+#   * Middleware     — wraps a handler: process(request, next) -> Response
+# A _Chain(RequestHandler) binds one Middleware to its `next`, so a stack folds into a single
+# RequestHandler. Everything is EXCEPTION-FREE: a middleware that wants to short-circuit returns a
+# Response (e.g. 400) instead of raising.
+#
+# Provided middlewares: CORS, TrustedHost, and ExceptionMiddleware (maps a returned error *status*
+# to a custom error page — the exception-free analogue of Starlette's exception handlers, since this
+# toolchain cannot catch raised exceptions). GZip is deferred to L6.1 (needs a zlib binding that is
+# not linkable on the current toolchain — only the gz* file API is bundled).
+
+from ..asgi.types import Response
+from ..compress.gzip import gzip_compress
+from .requests import Request
+from .responses import plain_text
+
+
+class RequestHandler:
+    """A node in the request pipeline (the app, or the 'next' seen by a middleware)."""
+    def handle(self, request: Request) -> Response:
+        return plain_text("Not Found", 404)
+
+
+class Middleware:
+    """Wraps a RequestHandler. Override process(); call next.handle(request) to continue, or return
+    a Response directly to short-circuit."""
+    def process(self, request: Request, next: RequestHandler) -> Response:
+        return next.handle(request)
+
+
+class _Chain(RequestHandler):
+    """Binds one Middleware to the handler that follows it."""
+    mw: Middleware
+    next: RequestHandler
+
+    def __init__(self, mw: Middleware, next: RequestHandler):
+        self.mw = mw
+        self.next = next
+
+    def handle(self, request: Request) -> Response:
+        return self.mw.process(request, self.next)
+
+
+def build_chain(app: RequestHandler, middlewares: List[Middleware]) -> RequestHandler:
+    """Fold middlewares around `app`. middlewares[0] becomes the OUTERMOST layer (runs first on the
+    way in, last on the way out) — same ordering as Starlette's middleware list."""
+    h = app
+    i = len(middlewares) - 1
+    while i >= 0:
+        h = _Chain(middlewares[i], h)
+        i -= 1
+    return h
+
+
+# ---- CORS ---------------------------------------------------------------------------------------
+
+class CORSMiddleware(Middleware):
+    """Adds CORS headers and answers preflight OPTIONS. `allow_origins` of ["*"] allows any origin;
+    `allow_methods`/`allow_headers` are pre-joined header strings (e.g. "GET, POST")."""
+    allow_origins: List[str]
+    allow_methods: str
+    allow_headers: str
+    allow_credentials: bool
+    max_age: int
+
+    def __init__(self, allow_origins: List[str],
+                 allow_methods: str = "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                 allow_headers: str = "*",
+                 allow_credentials: bool = False,
+                 max_age: int = 600):
+        self.allow_origins = allow_origins
+        self.allow_methods = allow_methods
+        self.allow_headers = allow_headers
+        self.allow_credentials = allow_credentials
+        self.max_age = max_age
+
+    def _wildcard(self) -> bool:
+        return len(self.allow_origins) == 1 and self.allow_origins[0] == "*"
+
+    def _allowed(self, origin: str) -> bool:
+        if origin == "":
+            return False
+        if self._wildcard():
+            return True
+        for o in self.allow_origins:
+            if o == origin:
+                return True
+        return False
+
+    def _apply(self, resp: Response, origin: str) -> None:
+        if not self._allowed(origin):
+            return
+        ao = "*" if (self._wildcard() and not self.allow_credentials) else origin
+        resp.headers.append(("Access-Control-Allow-Origin", ao))
+        if self.allow_credentials:
+            resp.headers.append(("Access-Control-Allow-Credentials", "true"))
+        resp.headers.append(("Vary", "Origin"))
+
+    def process(self, request: Request, next: RequestHandler) -> Response:
+        origin = request.header("origin")
+        is_preflight = (request.method() == "OPTIONS"
+                        and request.header("access-control-request-method") != "")
+        if is_preflight:
+            resp = Response(204, List[Tuple[str, str]](), "")
+            self._apply(resp, origin)
+            resp.headers.append(("Access-Control-Allow-Methods", self.allow_methods))
+            resp.headers.append(("Access-Control-Allow-Headers", self.allow_headers))
+            if self.max_age >= 0:
+                resp.headers.append(("Access-Control-Max-Age", str(self.max_age)))
+            return resp
+        resp = next.handle(request)
+        self._apply(resp, origin)
+        return resp
+
+
+# ---- TrustedHost --------------------------------------------------------------------------------
+
+class TrustedHostMiddleware(Middleware):
+    """Rejects requests whose Host header isn't in `allowed_hosts` with a 400. "*" allows all;
+    a "*.example.com" entry matches any subdomain of example.com."""
+    allowed_hosts: List[str]
+
+    def __init__(self, allowed_hosts: List[str]):
+        self.allowed_hosts = allowed_hosts
+
+    def _ok(self, hostname: str) -> bool:
+        for h in self.allowed_hosts:
+            if h == "*":
+                return True
+            if h == hostname:
+                return True
+            if h.startswith("*.") and (hostname.endswith(h[1:]) or hostname == h[2:]):
+                return True
+        return False
+
+    def process(self, request: Request, next: RequestHandler) -> Response:
+        host = request.header("host")
+        colon = host.find(":")
+        hostname = host[:colon] if colon >= 0 else host
+        if self._ok(hostname):
+            return next.handle(request)
+        return plain_text("Invalid host header", 400)
+
+
+# ---- GZip ---------------------------------------------------------------------------------------
+
+class GZipMiddleware(Middleware):
+    """Compresses buffered responses with gzip (the pure-Codon codec in `compress/`) when the client
+    advertises `Accept-Encoding: gzip` and the body is at least `minimum_size` bytes. Streamed
+    responses (a Response.producer) and already-encoded responses are passed through untouched."""
+    minimum_size: int
+
+    def __init__(self, minimum_size: int = 500):
+        self.minimum_size = minimum_size
+
+    def _already_encoded(self, resp: Response) -> bool:
+        for (k, v) in resp.headers:
+            if k.lower() == "content-encoding":
+                return True
+        return False
+
+    def process(self, request: Request, next: RequestHandler) -> Response:
+        resp = next.handle(request)
+        if request.header("accept-encoding").lower().find("gzip") < 0:
+            return resp
+        if resp.producer is not None:
+            return resp                    # streamed: a streaming deflate is future work
+        if len(resp.body) < self.minimum_size:
+            return resp
+        if self._already_encoded(resp):
+            return resp
+        resp.body = gzip_compress(resp.body)
+        resp.headers.append(("Content-Encoding", "gzip"))
+        resp.headers.append(("Vary", "Accept-Encoding"))
+        return resp
+
+
+# ---- Exception (error-status) handling ----------------------------------------------------------
+
+class ErrorHandler:
+    """A custom error-page producer for a given status. Override handle()."""
+    def handle(self, request: Request, status: int) -> Response:
+        return plain_text("Error " + str(status), status)
+
+
+class ExceptionMiddleware(Middleware):
+    """Intercepts error responses on the way out: if the downstream handler returned a status with a
+    registered ErrorHandler, that handler's Response replaces it (custom 404/500 pages, etc.). This
+    is the exception-free analogue of Starlette's exception_handlers — handlers raise nothing; they
+    return error responses and this maps them."""
+    handlers: Dict[int, ErrorHandler]
+
+    def __init__(self):
+        self.handlers = Dict[int, ErrorHandler]()
+
+    def add(self, status: int, handler: ErrorHandler) -> None:
+        self.handlers[status] = handler
+
+    def process(self, request: Request, next: RequestHandler) -> Response:
+        resp = next.handle(request)
+        if resp.status in self.handlers:
+            return self.handlers[resp.status].handle(request, resp.status)
+        return resp

@@ -1,0 +1,101 @@
+# fastcodon.web.responses — P62: Starlette-equivalent response constructors.
+#
+# Thin builders over the asgi-layer `Response` (which the HTTP transport already knows how to
+# serialize, buffered or chunked). Each returns an asgi `Response`; Content-Length / Date /
+# Connection are added by the transport, so these only set semantic headers (Content-Type, Location,
+# Set-Cookie, ...). Exception-free.
+
+from ..asgi.types import Response, BodyProducer, FileBodyProducer
+from ..json.value import JsonValue
+from ..json.encoder import dumps
+from ..urllib.cookies import dump_cookie
+
+
+def plain_text(body: str, status: int = 200) -> Response:
+    return Response.plain(status, body, "text/plain; charset=utf-8")
+
+
+def html(body: str, status: int = 200) -> Response:
+    return Response.plain(status, body, "text/html; charset=utf-8")
+
+
+def json_str(body: str, status: int = 200) -> Response:
+    """`body` is already-serialized JSON."""
+    return Response.plain(status, body, "application/json")
+
+
+def json_response(value: JsonValue, status: int = 200) -> Response:
+    return Response.plain(status, dumps(value), "application/json")
+
+
+def redirect(location: str, status: int = 307) -> Response:
+    """Default 307 (Temporary Redirect, preserves method) — Starlette's RedirectResponse default."""
+    h = List[Tuple[str, str]]()
+    h.append(("Location", location))
+    return Response(status, h, "")
+
+
+def streaming(producer: BodyProducer, status: int = 200,
+              content_type: str = "application/octet-stream") -> Response:
+    return Response.stream(producer, status, content_type)
+
+
+_CONTENT_TYPES = {
+    "html": "text/html; charset=utf-8",
+    "htm": "text/html; charset=utf-8",
+    "txt": "text/plain; charset=utf-8",
+    "css": "text/css; charset=utf-8",
+    "js": "text/javascript; charset=utf-8",
+    "json": "application/json",
+    "xml": "application/xml",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "svg": "image/svg+xml",
+    "ico": "image/x-icon",
+    "pdf": "application/pdf",
+    "woff": "font/woff",
+    "woff2": "font/woff2",
+}
+
+
+def guess_content_type(path: str) -> str:
+    dot = path.rfind(".")
+    if dot >= 0:
+        ext = path[dot + 1:].lower()
+        if ext in _CONTENT_TYPES:
+            return _CONTENT_TYPES[ext]
+    return "application/octet-stream"
+
+
+def file_response(path: str, status: int = 200,
+                  content_type: str = "",
+                  filename: str = "",
+                  block: int = 65536) -> Response:
+    """Stream a file from disk (chunked) with a guessed Content-Type. If `filename` is given, also
+    sets a Content-Disposition: attachment header (a download)."""
+    ct = content_type if content_type != "" else guess_content_type(path)
+    prod: BodyProducer = FileBodyProducer(path, block)
+    h = List[Tuple[str, str]]()
+    h.append(("Content-Type", ct))
+    if filename != "":
+        h.append(("Content-Disposition", "attachment; filename=\"" + filename + "\""))
+    return Response(status, h, "", prod)
+
+
+# ---- header / cookie mutators (return the same Response for chaining-style use) ------------------
+
+def with_header(resp: Response, name: str, value: str) -> Response:
+    resp.headers.append((name, value))
+    return resp
+
+
+def set_cookie(resp: Response, name: str, value: str,
+               path: str = "/", max_age: int = -1, http_only: bool = False,
+               secure: bool = False, same_site: str = "", domain: str = "",
+               expires: str = "") -> Response:
+    resp.headers.append(("Set-Cookie",
+                         dump_cookie(name, value, path, max_age, http_only,
+                                     secure, same_site, domain, expires)))
+    return resp

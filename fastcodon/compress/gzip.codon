@@ -1,0 +1,33 @@
+# fastcodon.compress.gzip — gzip stream writer (RFC 1952) over the DEFLATE encoder, pure Codon.
+# Layout: 10-byte header · raw DEFLATE body · CRC-32(input) LE · ISIZE (len mod 2^32) LE.
+from ..sys.buf import bytes_to_str
+from .crc32 import crc32
+from .deflate import deflate
+
+
+def _u32le(out: List[byte], v: int):
+    out.append(byte(v & 0xFF))
+    out.append(byte((v >> 8) & 0xFF))
+    out.append(byte((v >> 16) & 0xFF))
+    out.append(byte((v >> 24) & 0xFF))
+
+
+def gzip_compress(data: str) -> str:
+    """Return a complete gzip stream for `data` (Content-Encoding: gzip)."""
+    out = List[byte]()
+    # header: magic, CM=deflate(8), FLG=0, MTIME=0, XFL=0, OS=255(unknown)
+    out.append(byte(0x1F))
+    out.append(byte(0x8B))
+    out.append(byte(0x08))
+    out.append(byte(0x00))
+    out.append(byte(0x00)); out.append(byte(0x00)); out.append(byte(0x00)); out.append(byte(0x00))
+    out.append(byte(0x00))
+    out.append(byte(0xFF))
+    header = bytes_to_str(out)
+
+    body = deflate(data)
+
+    trailer = List[byte]()
+    _u32le(trailer, int(crc32(data)))
+    _u32le(trailer, len(data) & 0xFFFFFFFF)
+    return header + body + bytes_to_str(trailer)

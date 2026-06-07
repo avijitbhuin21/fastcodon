@@ -1,26 +1,45 @@
-# fastcodon.asgi.http_transport — P42: HTTP/1.1 transport for ONE accepted connection.
+# fastcodon.asgi.http_transport — P42/P42b: HTTP/1.1 transport for ONE accepted connection.
 #
-# Drives a request/response cycle over a `Stream` as a continuation state machine (no `await`):
-#   READING -> read_some() into a RequestParser until result() is non-None (or parse error / EOF)
-#   HANDLING -> build Scope + body, call app.handle(...), serialize the Response, write() it
-#   WRITTEN  -> if keep-alive: reset and loop for the next request; else close()
+# Drives request/response cycles over a `Stream` as a continuation state machine (no `await`). It
+# uses the incremental StreamingRequestParser (P42b) so the body is framed piecewise and never has
+# to be buffered whole. Per request, after the header block is parsed it picks one of three paths:
 #
-# Because the Stream allows only one read and one write in flight at a time, and a continuation's
-# run() reads its result off its OWN primitive fields (self.data / self.eof / self.errored), we use
-# a single Continuation subclass (ConnStep) bound to the HTTPConnection; run() re-dispatches based
-# on the connection's stored phase. This avoids any Completion<->Continuation type cycle.
+#   * WebSocket upgrade  -> write the 101 handshake, hand the Stream to a WebSocketConnection (P43).
+#   * streaming app      -> app.wants_stream(scope) True: hand the app a pull-based RequestBody +
+#                           a Responder; the app drains the body chunk-by-chunk, then responds.
+#   * buffered (default) -> accumulate the whole body, call app.handle(scope, body) -> Response.
+#
+# The response itself is either buffered (Content-Length) or streamed (Transfer-Encoding: chunked,
+# via a Response.producer pulled chunk-by-chunk) — both directions stream without full buffering.
+#
+# Codon idioms: the Stream allows ONE read + ONE write in flight, so each phase issues at most one
+# op and re-issues only from the prior completion. A single ConnStep(Continuation) re-dispatches by
+# the connection's stored `phase`. ConnStep/StreamRequestBody/ConnResponder are defined AFTER
+# HTTPConnection (their `conn` field names it); HTTPConnection names them only in method bodies —
+# one-directional, so Codon's eager field resolution sees no type cycle.
 
-from ..reactor import Reactor
-from ..aio.streams import Stream, Completion, Continuation
-from ..http.parser import RequestParser, Request, keep_alive
+from ..aio.streams import Stream, Continuation
+from ..http.parser import StreamingRequestParser, Request, keep_alive
 from ..urllib.httpdate import format_http_date
-from .types import ASGIApp, Scope, Response, scope_from_request
+from ..websocket import build_handshake_response
+from .types import (ASGIApp, Scope, Response, scope_from_request,
+                    BodyProducer, BodyReader, RequestBody, Responder, WebSocketEndpoint,
+                    BackgroundTask)
+from .ws_transport import WebSocketConnection
 
 from time import time
 
+CRLF = "\r\n"
+
 # connection phases (what the last issued async op was, so the continuation knows how to react).
-_PHASE_READ: Literal[int] = 0
-_PHASE_WRITE: Literal[int] = 1
+_PHASE_HEAD: Literal[int] = 0          # reading the request header block
+_PHASE_BUF_BODY: Literal[int] = 1      # reading body bytes for the buffered path
+_PHASE_STREAM_BODY: Literal[int] = 2   # reading body bytes to satisfy a streaming-app pull
+_PHASE_WRITE: Literal[int] = 3         # writing a buffered response
+_PHASE_STREAM_WRITE: Literal[int] = 4  # writing a chunked (streamed) response head/chunk
+_PHASE_WS_HANDSHAKE: Literal[int] = 5  # writing the 101 Switching Protocols response
+
+_HEXD = "0123456789abcdef"
 
 
 def _reason(status: int) -> str:
@@ -40,96 +59,354 @@ def _reason(status: int) -> str:
     return "OK"
 
 
+def _hex_lower(n: int) -> str:
+    """Lowercase hex with no prefix (HTTP/1.1 chunk size)."""
+    if n == 0:
+        return "0"
+    rev = List[str]()
+    v = n
+    while v > 0:
+        rev.append(_HEXD[v & 0xf])
+        v >>= 4
+    out = List[str]()
+    i = len(rev) - 1
+    while i >= 0:
+        out.append(rev[i])
+        i -= 1
+    return "".join(out)
+
+
+def _is_ws_upgrade(scope: Scope) -> bool:
+    """RFC 6455 upgrade request detection from the parsed headers."""
+    up = scope.get("upgrade")
+    conn = scope.get("connection")
+    key = scope.get("sec-websocket-key")
+    if up is None or conn is None or key is None:
+        return False
+    if up.lower().find("websocket") < 0:
+        return False
+    if conn.lower().find("upgrade") < 0:
+        return False
+    return True
+
+
 class HTTPConnection:
     """Owns one accepted connection's request/response cycles over a Stream."""
     stream: Stream
     app: ASGIApp
-    parser: RequestParser
+    sparser: StreamingRequestParser
     phase: int
+    keepalive: bool
     close_after_write: bool
+    scope: Scope                          # built once the headers are parsed
+    bodyacc: str                          # buffered-path body accumulator
+    producer: Optional[BodyProducer]      # streamed-response source (None => buffered response)
+    streaming_done: bool
+    streaming_in: bool
+    pending_reader: Optional[BodyReader]  # in-flight streaming-app body pull
+    ws_endpoint: Optional[WebSocketEndpoint]
+    handed_off: bool                      # the Stream now belongs to a WebSocketConnection
+    bg: List[BackgroundTask]              # tasks to run once the current response is fully written
 
     def __init__(self, stream: Stream, app: ASGIApp):
         self.stream = stream
         self.app = app
-        self.parser = RequestParser()
-        self.phase = _PHASE_READ
+        self.sparser = StreamingRequestParser()
+        self.phase = _PHASE_HEAD
+        self.keepalive = True
         self.close_after_write = False
+        self.scope = Scope("http", "", "", "", "", List[Tuple[str, str]]())
+        self.bodyacc = ""
+        self.producer = None
+        self.streaming_done = False
+        self.streaming_in = False
+        self.pending_reader = None
+        self.ws_endpoint = None
+        self.handed_off = False
+        self.bg = List[BackgroundTask]()
 
     def start(self):
         """Kick off the first read."""
-        self._issue_read()
+        self._issue_read(_PHASE_HEAD)
 
-    # ---- state machine --------------------------------------------------------------------
-    def _issue_read(self):
-        self.phase = _PHASE_READ
+    # ---- dispatch ------------------------------------------------------------------------
+    def _issue_read(self, phase: int):
+        self.phase = phase
         self.stream.read_some().then(ConnStep(self))
 
     def _on_complete(self, data: str, eof: bool, errored: bool):
-        if self.phase == _PHASE_READ:
-            self._on_read(data, eof, errored)
-        else:
+        if self.handed_off:
+            return                        # a WebSocketConnection owns the stream now
+        p = self.phase
+        if p == _PHASE_HEAD:
+            self._on_head_read(data, eof, errored)
+        elif p == _PHASE_BUF_BODY:
+            self._on_buf_body_read(data, eof, errored)
+        elif p == _PHASE_STREAM_BODY:
+            self._on_stream_body_read(data, eof, errored)
+        elif p == _PHASE_WRITE:
             self._on_written(errored)
+        elif p == _PHASE_STREAM_WRITE:
+            self._on_stream_written(errored)
+        else:  # _PHASE_WS_HANDSHAKE
+            self._on_handshake_written(errored)
 
-    def _on_read(self, data: str, eof: bool, errored: bool):
+    # ---- header phase --------------------------------------------------------------------
+    def _on_head_read(self, data: str, eof: bool, errored: bool):
         if errored:
             self.stream.close()
             return
         if len(data) > 0:
+            self.sparser.feed(data)
             try:
-                self.parser.feed(data)
+                ready = self.sparser.headers_ready()
             except:
                 self._send_error(400)
                 return
-            req = self.parser.result()
-            if req is not None:
-                self._dispatch(req)
+            if ready:
+                self._after_headers()
                 return
-            # need more bytes
-            self._issue_read()
+            self._issue_read(_PHASE_HEAD)
             return
-        # data == "" -> EOF with no (or partial) request.
         if eof:
             self.stream.close()
             return
-        # spurious empty read without eof: try again.
-        self._issue_read()
+        self._issue_read(_PHASE_HEAD)
 
-    def _dispatch(self, req: Request):
-        scope = scope_from_request(req)
-        resp = self.app.handle(scope, req.body)
-        alive = keep_alive(req)
-        self.close_after_write = not alive
-        payload = self._serialize(resp, alive)
-        self.phase = _PHASE_WRITE
-        self.stream.write(payload).then(ConnStep(self))
+    def _after_headers(self):
+        (method, target, version, headers) = self.sparser.request_head()
+        req = Request(method, target, version, headers, "")
+        self.scope = scope_from_request(req)
+        self.keepalive = keep_alive(req)
+        sc = self.scope
+        # 1) WebSocket upgrade?
+        if _is_ws_upgrade(sc):
+            ep = self.app.websocket_endpoint(sc)
+            if ep is not None:
+                self._do_handshake(sc, ep)
+                return
+        # 2) streaming app?
+        if self.app.wants_stream(sc):
+            self.streaming_in = True
+            # Upcast to the base types before the virtual handle_stream call (Codon's thunk
+            # dispatch requires the args to match the base signature, not the concrete subtype).
+            body: RequestBody = StreamRequestBody(self)
+            responder: Responder = ConnResponder(self)
+            self.app.handle_stream(sc, body, responder)
+            return
+        # 3) buffered (default)
+        self.bodyacc = ""
+        self._pump_buf_body()
+
+    # ---- buffered body path --------------------------------------------------------------
+    def _pump_buf_body(self):
+        try:
+            (chunk, done) = self.sparser.take_body_chunk()
+        except:
+            self._send_error(400)
+            return
+        if len(chunk) > 0:
+            self.bodyacc += chunk
+        if done:
+            self._dispatch_buffered()
+            return
+        self._issue_read(_PHASE_BUF_BODY)
+
+    def _on_buf_body_read(self, data: str, eof: bool, errored: bool):
+        if errored:
+            self.stream.close()
+            return
+        if len(data) > 0:
+            self.sparser.feed(data)
+        try:
+            (chunk, done) = self.sparser.take_body_chunk()
+        except:
+            self._send_error(400)
+            return
+        if len(chunk) > 0:
+            self.bodyacc += chunk
+        if done:
+            self._dispatch_buffered()
+            return
+        if eof:
+            self.stream.close()           # body truncated before completion
+            return
+        self._issue_read(_PHASE_BUF_BODY)
+
+    def _dispatch_buffered(self):
+        resp = self.app.handle(self.scope, self.bodyacc)
+        self._respond(resp)
+
+    # ---- streaming-app body pull (RequestBody.read_chunk -> here) -------------------------
+    def _body_read_chunk(self, reader: BodyReader):
+        if self.pending_reader is not None:
+            # one pull at a time — issuing another before the prior completes is a usage error.
+            reader.data = ""
+            reader.done = False
+            reader.errored = True
+            reader.on_chunk()
+            return
+        self.pending_reader = reader
+        self._serve_body_pull(False)
+
+    def _serve_body_pull(self, eof: bool):
+        try:
+            (chunk, done) = self.sparser.take_body_chunk()
+        except:
+            self._fail_reader()
+            return
+        if len(chunk) > 0 or done:
+            rdr = self.pending_reader
+            self.pending_reader = None
+            if rdr is not None:
+                rdr.data = chunk
+                rdr.done = done
+                rdr.errored = False
+                rdr.on_chunk()
+            return
+        if eof:
+            self._fail_reader()           # truncated body
+            return
+        self._issue_read(_PHASE_STREAM_BODY)
+
+    def _on_stream_body_read(self, data: str, eof: bool, errored: bool):
+        if errored:
+            self._fail_reader()
+            return
+        if len(data) > 0:
+            self.sparser.feed(data)
+        self._serve_body_pull(eof)
+
+    def _fail_reader(self):
+        rdr = self.pending_reader
+        self.pending_reader = None
+        if rdr is not None:
+            rdr.data = ""
+            rdr.done = False
+            rdr.errored = True
+            rdr.on_chunk()
+
+    # ---- response (Responder.respond -> here) --------------------------------------------
+    def _respond(self, resp: Response):
+        self.close_after_write = not self.keepalive
+        self.bg = resp.background
+        p = resp.producer
+        if p is not None:
+            self.producer = p
+            self.streaming_done = False
+            head = self._serialize_stream_head(resp)
+            self.phase = _PHASE_STREAM_WRITE
+            self.stream.write(head).then(ConnStep(self))
+        else:
+            payload = self._serialize(resp, self.keepalive)
+            self.phase = _PHASE_WRITE
+            self.stream.write(payload).then(ConnStep(self))
 
     def _send_error(self, status: int):
         body = _reason(status)
         h = List[Tuple[str, str]]()
         h.append(("Content-Type", "text/plain; charset=utf-8"))
         resp = Response(status, h, body)
-        self.close_after_write = True       # always close after an error response
+        self.close_after_write = True     # always close after an error response
+        self.keepalive = False
         payload = self._serialize(resp, False)
         self.phase = _PHASE_WRITE
         self.stream.write(payload).then(ConnStep(self))
 
     def _on_written(self, errored: bool):
-        if errored or self.close_after_write:
+        if errored:
             self.stream.close()
             return
-        # keep-alive: reset for the next request on the same connection.
-        self.parser = RequestParser()
-        self._issue_read()
+        self._after_response()
 
-    # ---- serialization --------------------------------------------------------------------
+    # ---- streamed (chunked) response -----------------------------------------------------
+    def _pump_next_chunk(self):
+        prod = self.producer
+        if prod is None:
+            self._after_response()
+            return
+        chunk = prod.next_chunk()
+        self.phase = _PHASE_STREAM_WRITE
+        if len(chunk) == 0:
+            self.streaming_done = True
+            self.stream.write("0\r\n\r\n").then(ConnStep(self))
+        else:
+            framed = _hex_lower(len(chunk)) + CRLF + chunk + CRLF
+            self.stream.write(framed).then(ConnStep(self))
+
+    def _on_stream_written(self, errored: bool):
+        if errored:
+            self.stream.close()
+            return
+        if self.streaming_done:
+            self.producer = None
+            self.streaming_done = False
+            self._after_response()
+            return
+        self._pump_next_chunk()
+
+    # ---- background tasks: run once the response is fully written -------------------------
+    def _run_background(self):
+        tasks = self.bg
+        self.bg = List[BackgroundTask]()
+        for t in tasks:
+            t.run()
+
+    # ---- end of one response: keep-alive reset, or close ---------------------------------
+    def _after_response(self):
+        self._run_background()
+        if self.close_after_write:
+            self.stream.close()
+            return
+        leftover = self.sparser.leftover()
+        self.sparser = StreamingRequestParser()
+        self.streaming_in = False
+        self.pending_reader = None
+        self.bodyacc = ""
+        self.producer = None
+        self.streaming_done = False
+        if len(leftover) > 0:
+            self.sparser.feed(leftover)
+            try:
+                ready = self.sparser.headers_ready()
+            except:
+                self._send_error(400)
+                return
+            if ready:
+                self._after_headers()
+                return
+        self._issue_read(_PHASE_HEAD)
+
+    # ---- WebSocket upgrade handoff -------------------------------------------------------
+    def _do_handshake(self, scope: Scope, ep: WebSocketEndpoint):
+        key = scope.get("sec-websocket-key")
+        k = key if key is not None else ""
+        self.ws_endpoint = ep
+        resp = build_handshake_response(k)
+        self.phase = _PHASE_WS_HANDSHAKE
+        self.stream.write(resp).then(ConnStep(self))
+
+    def _on_handshake_written(self, errored: bool):
+        if errored:
+            self.stream.close()
+            return
+        ep = self.ws_endpoint
+        if ep is None:
+            self.stream.close()
+            return
+        leftover = self.sparser.leftover()    # any frame bytes pipelined after the handshake
+        self.handed_off = True
+        conn = WebSocketConnection(self.stream, ep, leftover)
+        conn.start()
+
+    # ---- serialization -------------------------------------------------------------------
     def _serialize(self, resp: Response, keep: bool) -> str:
         out = List[str]()
         out.append("HTTP/1.1 ")
         out.append(str(resp.status))
         out.append(" ")
         out.append(_reason(resp.status))
-        out.append("\r\n")
-        # caller-supplied headers (we add the framing/connection/date ones ourselves).
+        out.append(CRLF)
         for (k, v) in resp.headers:
             lk = k.lower()
             if lk == "content-length" or lk == "connection" or lk == "date":
@@ -137,29 +414,72 @@ class HTTPConnection:
             out.append(k)
             out.append(": ")
             out.append(v)
-            out.append("\r\n")
+            out.append(CRLF)
         out.append("Content-Length: ")
         out.append(str(len(resp.body)))
-        out.append("\r\n")
+        out.append(CRLF)
         out.append("Connection: ")
         out.append("keep-alive" if keep else "close")
-        out.append("\r\n")
+        out.append(CRLF)
         out.append("Date: ")
         out.append(format_http_date(int(time())))
-        out.append("\r\n\r\n")
+        out.append(CRLF)
+        out.append(CRLF)
         out.append(resp.body)
+        return "".join(out)
+
+    def _serialize_stream_head(self, resp: Response) -> str:
+        out = List[str]()
+        out.append("HTTP/1.1 ")
+        out.append(str(resp.status))
+        out.append(" ")
+        out.append(_reason(resp.status))
+        out.append(CRLF)
+        for (k, v) in resp.headers:
+            lk = k.lower()
+            if lk == "content-length" or lk == "connection" or lk == "date" or lk == "transfer-encoding":
+                continue
+            out.append(k)
+            out.append(": ")
+            out.append(v)
+            out.append(CRLF)
+        out.append("Transfer-Encoding: chunked")
+        out.append(CRLF)
+        out.append("Connection: ")
+        out.append("keep-alive" if self.keepalive else "close")
+        out.append(CRLF)
+        out.append("Date: ")
+        out.append(format_http_date(int(time())))
+        out.append(CRLF)
+        out.append(CRLF)
         return "".join(out)
 
 
 class ConnStep(Continuation):
-    """The single continuation re-dispatched after each async op on the connection. Defined AFTER
-    HTTPConnection so the field annotation `conn: HTTPConnection` resolves (Codon resolves field
-    annotations eagerly); HTTPConnection only references ConnStep inside method bodies, which are
-    resolved lazily — keeping the type dependency one-directional (same idiom as the reactor)."""
+    """The single continuation re-dispatched after each async op on the connection (see module
+    docstring for why it is defined after HTTPConnection)."""
     conn: HTTPConnection
     def __init__(self, conn: HTTPConnection):
         super().__init__()
         self.conn = conn
     def run(self):
-        # Hand the primitive result back to the connection, which re-dispatches by phase.
         self.conn._on_complete(self.data, self.eof, self.errored)
+
+
+class StreamRequestBody(RequestBody):
+    """The concrete RequestBody handed to a streaming app: each read_chunk forwards to the owning
+    connection's body pull. Names HTTPConnection by field (defined above) — no eager cycle."""
+    conn: HTTPConnection
+    def __init__(self, conn: HTTPConnection):
+        self.conn = conn
+    def read_chunk(self, reader: BodyReader) -> None:
+        self.conn._body_read_chunk(reader)
+
+
+class ConnResponder(Responder):
+    """The concrete Responder handed to a streaming app: respond forwards to the connection."""
+    conn: HTTPConnection
+    def __init__(self, conn: HTTPConnection):
+        self.conn = conn
+    def respond(self, resp: Response) -> None:
+        self.conn._respond(resp)

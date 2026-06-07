@@ -57,7 +57,26 @@ run_test "multipart (P25)" test_multipart.py  1
 run_test "streams (P32)"     test_streams.py     1
 run_test "concurrency (P33)" test_concurrency.py 1
 # --- L4 protocol server (real HTTP round-trip over loopback) ---
-run_test "asgi server (P41/P42)" test_server.py  1
+run_test "asgi server (P41/P42)"    test_server.py          1
+run_test "stream response (P42b)"   test_stream_response.py 1
+run_test "stream request (P42b)"    test_stream_request.py  1
+run_test "websocket server (P43)"   test_websocket_server.py 1
+# --- L5 validation (Pydantic-equivalent) ---
+run_test "validate (P51-P54)"       test_validate.py        1
+run_test "json non-raising (L6.1)"  test_json_safe.py       1
+# --- L6 ASGI toolkit (Starlette-equivalent) ---
+run_test "datastructures (P61)"     test_datastructures.py     1
+run_test "requests/responses (P62)" test_requests_responses.py 1
+run_test "routing (P63)"            test_routing.py            1
+run_test "middleware (P64)"         test_middleware.py         1
+run_test "webapp e2e (L6)"          test_webapp_server.py      1
+run_test "ws routing (P65)"         test_ws_routing.py         1
+run_test "staticfiles (P65)"        test_staticfiles.py        1
+run_test "background tasks (P65)"   test_background.py         1
+run_test "exceptions (P65)"         test_exceptions.py         1
+run_test "sessions (L6.1)"          test_sessions.py           1
+run_test "compress/gzip (L6.1)"     test_compress.py           1
+run_test "gzip middleware (L6.1)"   test_gzip_middleware.py    1
 # TLS needs system OpenSSL (-lssl -lcrypto) + outbound network; optional in CI.
 run_test "tls (P14)"       test_tls_live.py   0  -l ssl -l crypto
 

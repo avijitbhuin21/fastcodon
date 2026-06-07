@@ -1,0 +1,96 @@
+# fastcodon.web.sessions — L6.1: signed-cookie sessions (Starlette SessionMiddleware equivalent).
+#
+# The session is a flat str->str map carried in a cookie, integrity-protected with HMAC-SHA256 (the
+# L1 crypto leaf). Cookie value is `<payload>.<sig>` where payload = base64url(urlencoded map) and
+# sig = HMAC-SHA256(secret, payload). On the way in, a present+valid cookie populates request.session
+# (a tampered or missing cookie yields an empty session — exception-free, no raise). On the way out,
+# the (possibly mutated) session is re-signed into a Set-Cookie. This is signed, NOT encrypted — do
+# not store secrets the client shouldn't read.
+
+from ..asgi.types import Response
+from ..crypto.base64 import b64encode, b64decode
+from ..crypto.hmac import hmac_sha256_hex
+from ..urllib.querystring import urlencode, parse_qsl
+from ..urllib.cookies import dump_cookie
+from .requests import Request
+from .middleware import Middleware, RequestHandler
+
+
+def _sign(secret: str, payload: str) -> str:
+    return hmac_sha256_hex(secret, payload)
+
+
+def _ct_eq(a: str, b: str) -> bool:
+    """Length-independent-ish constant-time string compare (both are hex of fixed length here)."""
+    if len(a) != len(b):
+        return False
+    diff = 0
+    for i in range(len(a)):
+        diff |= ord(a[i]) ^ ord(b[i])
+    return diff == 0
+
+
+def encode_session(secret: str, data: Dict[str, str]) -> str:
+    pairs = List[Tuple[str, str]]()
+    for k in data:
+        pairs.append((k, data[k]))
+    payload = b64encode(urlencode(pairs), urlsafe=True, pad=False)
+    return payload + "." + _sign(secret, payload)
+
+
+def decode_session(secret: str, cookie_value: str) -> Dict[str, str]:
+    """Verify + decode; returns an empty dict on any tamper/format error (never raises)."""
+    out = Dict[str, str]()
+    dot = cookie_value.rfind(".")
+    if dot <= 0:
+        return out
+    payload = cookie_value[:dot]
+    sig = cookie_value[dot + 1:]
+    if not _ct_eq(sig, _sign(secret, payload)):
+        return out
+    raw = b64decode(payload)
+    for (k, v) in parse_qsl(raw):
+        out[k] = v
+    return out
+
+
+class SessionMiddleware(Middleware):
+    """Loads/saves request.session via a signed cookie. Place it OUTERMOST-ish so inner handlers see
+    the loaded session and their mutations get saved."""
+    secret: str
+    cookie_name: str
+    max_age: int
+    path: str
+    http_only: bool
+    same_site: str
+    secure: bool
+
+    def __init__(self, secret: str, cookie_name: str = "session",
+                 max_age: int = 1209600, path: str = "/",
+                 http_only: bool = True, same_site: str = "Lax", secure: bool = False):
+        self.secret = secret
+        self.cookie_name = cookie_name
+        self.max_age = max_age
+        self.path = path
+        self.http_only = http_only
+        self.same_site = same_site
+        self.secure = secure
+
+    def process(self, request: Request, next: RequestHandler) -> Response:
+        # load
+        cookies = request.cookies()
+        if self.cookie_name in cookies:
+            request.session = decode_session(self.secret, cookies[self.cookie_name])
+        resp = next.handle(request)
+        # save (always re-emit so mutations persist; if empty, expire the cookie)
+        if len(request.session) > 0:
+            value = encode_session(self.secret, request.session)
+            resp.headers.append(("Set-Cookie",
+                                 dump_cookie(self.cookie_name, value, self.path, self.max_age,
+                                             self.http_only, self.secure, self.same_site)))
+        elif self.cookie_name in cookies:
+            # session cleared -> expire the cookie
+            resp.headers.append(("Set-Cookie",
+                                 dump_cookie(self.cookie_name, "", self.path, 0,
+                                             self.http_only, self.secure, self.same_site)))
+        return resp

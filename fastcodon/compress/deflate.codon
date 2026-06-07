@@ -1,0 +1,188 @@
+# fastcodon.compress.deflate — raw DEFLATE encoder (RFC 1951), pure Codon.
+#
+# One final block, BTYPE=01 (fixed Huffman), with greedy LZ77 matching over a 32 KB window via a
+# hash-chain. Output is a raw DEFLATE stream (no zlib/gzip wrapper — see gzip.codon for that).
+#
+# Bit packing follows the spec exactly: bytes are filled LSB-first; Huffman codes are emitted
+# MSB-first (most-significant bit of the code first); length/distance EXTRA bits are LSB-first.
+from ..sys.buf import byte_at, bytes_to_str
+
+_MINMATCH: Literal[int] = 3
+_MAXMATCH: Literal[int] = 258
+_WSIZE: Literal[int] = 32768
+_HASH_BITS: Literal[int] = 15
+_HASH_SIZE: Literal[int] = 1 << 15      # 32768
+_HASH_MASK: Literal[int] = (1 << 15) - 1
+_MAX_CHAIN: Literal[int] = 128
+
+# Length codes 257..285: base length + extra bits (RFC 1951 §3.2.5).
+_LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+             35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+_LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+              3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+# Distance codes 0..29: base distance + extra bits.
+_DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+              257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+              8193, 12289, 16385, 24577]
+_DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+               7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+
+
+class _BitWriter:
+    out: List[byte]
+    cur: int        # accumulated bits not yet flushed (low `nbits` bits valid)
+    nbits: int
+
+    def __init__(self):
+        self.out = List[byte]()
+        self.cur = 0
+        self.nbits = 0
+
+    def bits(self, value: int, count: int):
+        """Write `count` low bits of `value`, LSB first (for headers + extra bits)."""
+        v = value
+        i = 0
+        while i < count:
+            self.cur |= (v & 1) << self.nbits
+            self.nbits += 1
+            if self.nbits == 8:
+                self.out.append(byte(self.cur & 0xFF))
+                self.cur = 0
+                self.nbits = 0
+            v >>= 1
+            i += 1
+
+    def huff(self, code: int, length: int):
+        """Write a Huffman `code` of `length` bits, MSB first (per RFC 1951)."""
+        i = length - 1
+        while i >= 0:
+            self.cur |= ((code >> i) & 1) << self.nbits
+            self.nbits += 1
+            if self.nbits == 8:
+                self.out.append(byte(self.cur & 0xFF))
+                self.cur = 0
+                self.nbits = 0
+            i -= 1
+
+    def align(self):
+        """Flush the final partial byte (zero-padded)."""
+        if self.nbits > 0:
+            self.out.append(byte(self.cur & 0xFF))
+            self.cur = 0
+            self.nbits = 0
+
+
+def _fixed_litlen(sym: int) -> Tuple[int, int]:
+    """Fixed-Huffman code + bit length for a literal/length symbol 0..287 (RFC 1951 §3.2.6)."""
+    if sym < 144:
+        return (0x30 + sym, 8)
+    if sym < 256:
+        return (0x190 + (sym - 144), 9)
+    if sym < 280:
+        return (0x00 + (sym - 256), 7)
+    return (0xC0 + (sym - 280), 8)
+
+
+def _length_code(length: int) -> int:
+    """Index 0..28 into the length tables for a match length 3..258."""
+    i = 28
+    while i > 0:
+        if length >= _LEN_BASE[i]:
+            return i
+        i -= 1
+    return 0
+
+
+def _dist_code(dist: int) -> int:
+    """Index 0..29 into the distance tables for a match distance 1..32768."""
+    i = 29
+    while i > 0:
+        if dist >= _DIST_BASE[i]:
+            return i
+        i -= 1
+    return 0
+
+
+def _hash3(s: str, pos: int) -> int:
+    a = byte_at(s, pos)
+    b = byte_at(s, pos + 1)
+    c = byte_at(s, pos + 2)
+    return ((a << 10) ^ (b << 5) ^ c) & _HASH_MASK
+
+
+def _match_len(s: str, p: int, q: int, n: int) -> int:
+    # longest run where s[p+i] == s[q+i], capped at _MAXMATCH and the end of input.
+    maxl = n - p
+    if maxl > _MAXMATCH:
+        maxl = _MAXMATCH
+    i = 0
+    while i < maxl and byte_at(s, p + i) == byte_at(s, q + i):
+        i += 1
+    return i
+
+
+def deflate(data: str) -> str:
+    """Compress `data` to a raw DEFLATE stream (one final fixed-Huffman block)."""
+    bw = _BitWriter()
+    # Block header: BFINAL=1 (1 bit), BTYPE=01 fixed Huffman (2 bits) — both LSB-first.
+    bw.bits(1, 1)
+    bw.bits(1, 2)
+
+    n = len(data)
+    head = [-1 for _ in range(_HASH_SIZE)]
+    prev = [-1 for _ in range(n if n > 0 else 1)]
+
+    pos = 0
+    while pos < n:
+        best_len = 0
+        best_dist = 0
+        if pos + _MINMATCH <= n:
+            h = _hash3(data, pos)
+            cand = head[h]
+            chain = 0
+            while cand >= 0 and chain < _MAX_CHAIN and (pos - cand) <= _WSIZE:
+                l = _match_len(data, pos, cand, n)
+                if l > best_len:
+                    best_len = l
+                    best_dist = pos - cand
+                    if l >= _MAXMATCH:
+                        break
+                cand = prev[cand]
+                chain += 1
+
+        if best_len >= _MINMATCH:
+            # length symbol + extra bits
+            lc = _length_code(best_len)
+            (code, length) = _fixed_litlen(257 + lc)
+            bw.huff(code, length)
+            eb = _LEN_EXTRA[lc]
+            if eb > 0:
+                bw.bits(best_len - _LEN_BASE[lc], eb)
+            # distance symbol (fixed Huffman: 5-bit code) + extra bits
+            dc = _dist_code(best_dist)
+            bw.huff(dc, 5)
+            deb = _DIST_EXTRA[dc]
+            if deb > 0:
+                bw.bits(best_dist - _DIST_BASE[dc], deb)
+            # insert hashes for every covered position, then advance
+            end = pos + best_len
+            while pos < end:
+                if pos + _MINMATCH <= n:
+                    hh = _hash3(data, pos)
+                    prev[pos] = head[hh]
+                    head[hh] = pos
+                pos += 1
+        else:
+            (code, length) = _fixed_litlen(byte_at(data, pos))
+            bw.huff(code, length)
+            if pos + _MINMATCH <= n:
+                hh = _hash3(data, pos)
+                prev[pos] = head[hh]
+                head[hh] = pos
+            pos += 1
+
+    # end-of-block symbol 256, then pad to a byte boundary.
+    (eob, eoblen) = _fixed_litlen(256)
+    bw.huff(eob, eoblen)
+    bw.align()
+    return bytes_to_str(bw.out)

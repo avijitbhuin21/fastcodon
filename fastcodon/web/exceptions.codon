@@ -1,0 +1,74 @@
+# fastcodon.web.exceptions — P65: HTTP error helpers (HTTPException-equivalent, exception-free).
+#
+# Starlette/FastAPI raise `HTTPException(status, detail)`; this toolchain can't unwind exceptions,
+# so the equivalent is a constructor that RETURNS an error `Response` with a FastAPI-shaped JSON
+# body `{"detail": "..."}`. Endpoints `return http_error(404, "no such user")`; the router's own
+# 404/405 and any handler-returned error status can then be re-rendered by `ExceptionMiddleware`.
+
+from ..asgi.types import Response
+
+
+def status_reason(status: int) -> str:
+    if status == 200: return "OK"
+    if status == 201: return "Created"
+    if status == 202: return "Accepted"
+    if status == 204: return "No Content"
+    if status == 301: return "Moved Permanently"
+    if status == 302: return "Found"
+    if status == 303: return "See Other"
+    if status == 304: return "Not Modified"
+    if status == 307: return "Temporary Redirect"
+    if status == 308: return "Permanent Redirect"
+    if status == 400: return "Bad Request"
+    if status == 401: return "Unauthorized"
+    if status == 403: return "Forbidden"
+    if status == 404: return "Not Found"
+    if status == 405: return "Method Not Allowed"
+    if status == 406: return "Not Acceptable"
+    if status == 409: return "Conflict"
+    if status == 410: return "Gone"
+    if status == 415: return "Unsupported Media Type"
+    if status == 418: return "I'm a Teapot"
+    if status == 422: return "Unprocessable Entity"
+    if status == 429: return "Too Many Requests"
+    if status == 500: return "Internal Server Error"
+    if status == 501: return "Not Implemented"
+    if status == 502: return "Bad Gateway"
+    if status == 503: return "Service Unavailable"
+    return "Error"
+
+
+def _json_escape(s: str) -> str:
+    out = List[str]()
+    for i in range(len(s)):
+        c = s[i]
+        o = ord(c)
+        if c == '"':
+            out.append("\\\"")
+        elif c == "\\":
+            out.append("\\\\")
+        elif o == 10:
+            out.append("\\n")
+        elif o == 13:
+            out.append("\\r")
+        elif o == 9:
+            out.append("\\t")
+        elif o < 32:
+            out.append(" ")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def http_error(status: int, detail: str = "") -> Response:
+    """A JSON error response `{"detail": "..."}` (FastAPI shape). Empty `detail` uses the reason
+    phrase for `status`."""
+    d = detail if detail != "" else status_reason(status)
+    body = "{\"detail\":\"" + _json_escape(d) + "\"}"
+    return Response.plain(status, body, "application/json")
+
+
+def http_error_text(status: int, detail: str = "") -> Response:
+    """A plain-text error response (reason phrase if `detail` is empty)."""
+    d = detail if detail != "" else status_reason(status)
+    return Response.plain(status, d, "text/plain; charset=utf-8")

@@ -1,0 +1,377 @@
+# fastcodon.web.routing — P63: Starlette-equivalent routing.
+#
+# Path templates ("/users/{id}", "/files/{rest:path}") compile to an anchored regex with one capture
+# group per placeholder (inner groups are non-capturing, so capture i+1 maps to param i). Matching
+# uses the stdlib `re`. Endpoints are virtual-method objects (closures don't unify in Codon), and the
+# router is exception-free: misses return a 404/405 Response rather than raising.
+#
+# Definition order avoids Codon's eager field-cycle: Endpoint -> Route -> Match -> RouteEntry base ->
+# Router (holds List[RouteEntry]) -> Mount(RouteEntry) (holds Router). Mount/Router recurse only
+# through a base-typed list, which Codon resolves fine.
+
+import re
+from ..asgi.types import Response, WebSocketEndpoint
+from .requests import Request
+from .responses import plain_text
+
+
+class WSEndpointFactory:
+    """Produces a FRESH WebSocketEndpoint per connection (endpoints hold per-connection state, so
+    they can't be shared). Override create(); `params` carries the matched path params."""
+    def create(self, params: Dict[str, str]) -> WebSocketEndpoint:
+        return WebSocketEndpoint()
+
+
+class WSRoute:
+    """A WebSocket route: a path template (same converters as HTTP routes) bound to a factory."""
+    template: str
+    pattern: str
+    param_names: List[str]
+    factory: WSEndpointFactory
+    name: str
+
+    def __init__(self, template: str, factory: WSEndpointFactory, name: str = ""):
+        self.template = template
+        (pat, names) = compile_path(template)
+        self.pattern = pat
+        self.param_names = names
+        self.factory = factory
+        self.name = name if name != "" else template
+
+    def match_ws(self, path: str) -> Optional[WebSocketEndpoint]:
+        m = re.match(self.pattern, path)
+        if m is None:
+            return None
+        params = Dict[str, str]()
+        idx = 1
+        for nm in self.param_names:
+            g: Optional[str] = m[idx]
+            if g is not None:
+                params[nm] = g
+            else:
+                params[nm] = ""
+            idx += 1
+        return self.factory.create(params)
+
+
+class Endpoint:
+    """One route handler. Subclass and override handle(); one shared instance per route."""
+    def handle(self, request: Request) -> Response:
+        return plain_text("Not Implemented", 501)
+
+
+def _escape_literal(s: str) -> str:
+    """Regex-escape a literal path segment (so '.' etc. match literally)."""
+    out = List[str]()
+    meta = ".^$*+?()[]|\\"
+    for i in range(len(s)):
+        c = s[i]
+        if c in meta:
+            out.append("\\")
+        out.append(c)
+    return "".join(out)
+
+
+def _converter_regex(conv: str) -> str:
+    if conv == "int":
+        return "([0-9]+)"
+    if conv == "float":
+        return "([0-9]+(?:\\.[0-9]+)?)"
+    if conv == "path":
+        return "(.+)"
+    if conv == "uuid":
+        return ("([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                "[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+    # "str" or unknown -> any non-slash run
+    return "([^/]+)"
+
+
+def compile_path(template: str) -> Tuple[str, List[str]]:
+    """Return (anchored_regex, param_names). A placeholder is '{name}' or '{name:converter}'."""
+    pattern = List[str]()
+    names = List[str]()
+    pattern.append("^")
+    i = 0
+    n = len(template)
+    lit = List[str]()
+    while i < n:
+        c = template[i]
+        if c == "{":
+            end = template.find("}", i)
+            if end < 0:
+                lit.append(c)              # malformed; treat as literal
+                i += 1
+                continue
+            if len(lit) > 0:
+                pattern.append(_escape_literal("".join(lit)))
+                lit = List[str]()
+            inner = template[i + 1:end]
+            colon = inner.find(":")
+            if colon >= 0:
+                name = inner[:colon]
+                conv = inner[colon + 1:]
+            else:
+                name = inner
+                conv = "str"
+            names.append(name)
+            pattern.append(_converter_regex(conv))
+            i = end + 1
+        else:
+            lit.append(c)
+            i += 1
+    if len(lit) > 0:
+        pattern.append(_escape_literal("".join(lit)))
+    pattern.append("$")
+    return ("".join(pattern), names)
+
+
+def _norm_methods(methods: List[str]) -> List[str]:
+    out = List[str]()
+    for m in methods:
+        out.append(m.upper())
+    return out
+
+
+class Match:
+    """Result of resolving a path against a router tree."""
+    found: bool                    # the path matched some route (method may still mismatch)
+    response: Optional[Response]   # set iff a handler ran (path + method both matched)
+    methods: List[str]             # allowed methods, for a 405 when found but response is None
+
+    def __init__(self, found: bool, response: Optional[Response], methods: List[str]):
+        self.found = found
+        self.response = response
+        self.methods = methods
+
+    @staticmethod
+    def miss() -> Match:
+        return Match(False, None, List[str]())
+
+
+class RouteEntry:
+    """Base for things a Router holds (a Route or a Mount). resolve() returns a Match."""
+    def resolve(self, request: Request, path: str) -> Match:
+        return Match.miss()
+
+    def url_for(self, name: str, params: Dict[str, str]) -> str:
+        """Reverse a named route to a path; "" means no match (Optional avoided so the virtual
+        return type stays a plain value — Codon's vtable realization rejects covariant Optionals)."""
+        return ""
+
+    def match_ws_entry(self, path: str) -> Optional[WebSocketEndpoint]:
+        """WS lookup hook for entries that contain sub-routers (Mount); plain Routes never match."""
+        return None
+
+
+class Route(RouteEntry):
+    template: str
+    pattern: str
+    param_names: List[str]
+    methods: List[str]
+    endpoint: Endpoint
+    name: str
+
+    def __init__(self, template: str, endpoint: Endpoint,
+                 methods: List[str], name: str = ""):
+        self.template = template
+        (pat, names) = compile_path(template)
+        self.pattern = pat
+        self.param_names = names
+        self.methods = _norm_methods(methods)
+        self.endpoint = endpoint
+        self.name = name if name != "" else template
+
+    def match(self, path: str) -> Optional[Dict[str, str]]:
+        m = re.match(self.pattern, path)
+        if m is None:
+            return None
+        params = Dict[str, str]()
+        idx = 1
+        for nm in self.param_names:
+            g: Optional[str] = m[idx]
+            if g is not None:
+                params[nm] = g
+            else:
+                params[nm] = ""
+            idx += 1
+        return params
+
+    def _method_ok(self, method: str) -> bool:
+        if method in self.methods:
+            return True
+        if method == "HEAD" and "GET" in self.methods:
+            return True
+        return False
+
+    def resolve(self, request: Request, path: str) -> Match:
+        params = self.match(path)
+        if params is None:
+            return Match.miss()
+        if self._method_ok(request.method()):
+            request.path_params = params
+            resp = self.endpoint.handle(request)
+            return Match(True, resp, self.methods)
+        return Match(True, None, self.methods)
+
+    def url_for(self, name: str, params: Dict[str, str]) -> str:
+        if name != self.name:
+            return ""
+        return self._build(params)
+
+    def _build(self, params: Dict[str, str]) -> str:
+        out = List[str]()
+        i = 0
+        n = len(self.template)
+        while i < n:
+            c = self.template[i]
+            if c == "{":
+                end = self.template.find("}", i)
+                if end < 0:
+                    out.append(c)
+                    i += 1
+                    continue
+                inner = self.template[i + 1:end]
+                colon = inner.find(":")
+                pname = inner[:colon] if colon >= 0 else inner
+                if pname in params:
+                    out.append(params[pname])
+                i = end + 1
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out)
+
+
+def _not_found() -> Response:
+    return plain_text("Not Found", 404)
+
+
+def _method_not_allowed(methods: List[str]) -> Response:
+    resp = plain_text("Method Not Allowed", 405)
+    resp.headers.append(("Allow", ", ".join(methods)))
+    return resp
+
+
+class Router(RouteEntry):
+    """Holds an ordered list of route entries; dispatches a Request to the first match. WebSocket
+    routes live in a parallel list (they resolve to a WebSocketEndpoint, not a Response)."""
+    entries: List[RouteEntry]
+    ws_routes: List[WSRoute]
+
+    def __init__(self):
+        self.entries = List[RouteEntry]()
+        self.ws_routes = List[WSRoute]()
+
+    def add_route(self, template: str, endpoint: Endpoint,
+                  methods: List[str], name: str = "") -> None:
+        self.entries.append(Route(template, endpoint, methods, name))
+
+    def get(self, template: str, endpoint: Endpoint, name: str = "") -> None:
+        self.add_route(template, endpoint, ["GET"], name)
+
+    def post(self, template: str, endpoint: Endpoint, name: str = "") -> None:
+        self.add_route(template, endpoint, ["POST"], name)
+
+    def put(self, template: str, endpoint: Endpoint, name: str = "") -> None:
+        self.add_route(template, endpoint, ["PUT"], name)
+
+    def delete(self, template: str, endpoint: Endpoint, name: str = "") -> None:
+        self.add_route(template, endpoint, ["DELETE"], name)
+
+    def mount(self, prefix: str, router: Router, name: str = "") -> None:
+        self.entries.append(Mount(prefix, router, name))
+
+    def websocket(self, template: str, factory: WSEndpointFactory, name: str = "") -> None:
+        self.ws_routes.append(WSRoute(template, factory, name))
+
+    def match_ws(self, path: str) -> Optional[WebSocketEndpoint]:
+        """Return a fresh WebSocketEndpoint for the first WS route matching `path`, else None. Also
+        descends into Mounts so WS routes can be registered on mounted sub-routers."""
+        for wr in self.ws_routes:
+            ep = wr.match_ws(path)
+            if ep is not None:
+                return ep
+        for e in self.entries:
+            sub = e.match_ws_entry(path)
+            if sub is not None:
+                return sub
+        return None
+
+    def add(self, entry: RouteEntry) -> None:
+        self.entries.append(entry)
+
+    def resolve(self, request: Request, path: str) -> Match:
+        found = False
+        allow = List[str]()
+        for e in self.entries:
+            m = e.resolve(request, path)
+            if m.response is not None:
+                return m
+            if m.found:
+                found = True
+                for mth in m.methods:
+                    if mth not in allow:
+                        allow.append(mth)
+        return Match(found, None, allow)
+
+    def dispatch(self, request: Request) -> Response:
+        m = self.resolve(request, request.path())
+        r = m.response
+        if r is not None:
+            return r
+        if m.found:
+            return _method_not_allowed(m.methods)
+        return _not_found()
+
+    def url_for(self, name: str, params: Dict[str, str]) -> str:
+        for e in self.entries:
+            u = e.url_for(name, params)
+            if u != "":
+                return u
+        return ""
+
+
+class Mount(RouteEntry):
+    """A sub-router mounted under `prefix`. Once the prefix matches, the inner router owns the
+    remainder of the path (so an inner miss is a 404, not a fall-through)."""
+    prefix: str
+    router: Router
+    name: str
+
+    def __init__(self, prefix: str, router: Router, name: str = ""):
+        # normalize: no trailing slash (except root)
+        p = prefix
+        if len(p) > 1 and p.endswith("/"):
+            p = p[:len(p) - 1]
+        self.prefix = p
+        self.router = router
+        self.name = name
+
+    def _remainder(self, path: str) -> str:
+        # Returns the sub-path (always starts with "/") or "" for no match. Plain str (not Optional)
+        # so it can be passed straight into the virtual Router.resolve — flow-narrowing of an
+        # Optional does NOT propagate into a virtual call's argument types on this toolchain.
+        if path == self.prefix:
+            return "/"
+        pre = self.prefix + "/"
+        if path.startswith(pre):
+            return path[len(self.prefix):]   # keeps the leading "/"
+        return ""
+
+    def resolve(self, request: Request, path: str) -> Match:
+        rem = self._remainder(path)
+        if rem == "":
+            return Match.miss()
+        return self.router.resolve(request, rem)
+
+    def url_for(self, name: str, params: Dict[str, str]) -> str:
+        inner = self.router.url_for(name, params)
+        if inner == "":
+            return ""
+        return self.prefix + inner
+
+    def match_ws_entry(self, path: str) -> Optional[WebSocketEndpoint]:
+        rem = self._remainder(path)
+        if rem == "":
+            return None
+        return self.router.match_ws(rem)

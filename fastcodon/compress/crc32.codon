@@ -1,0 +1,35 @@
+# fastcodon.compress.crc32 — CRC-32 (IEEE 802.3, poly 0xEDB88320), pure Codon.
+# Used by the gzip trailer; also useful standalone. Byte-wise table algorithm.
+from ..sys.buf import byte_at
+
+_TABLE = List[u32]()
+
+
+def _build_table():
+    if len(_TABLE) == 256:
+        return
+    c = 0
+    while c < 256:
+        crc = u32(c)
+        k = 0
+        while k < 8:
+            if int(crc & u32(1)) != 0:
+                crc = u32(0xEDB88320) ^ (crc >> u32(1))
+            else:
+                crc = crc >> u32(1)
+            k += 1
+        _TABLE.append(crc)
+        c += 1
+
+
+def crc32(data: str) -> u32:
+    """CRC-32 of `data`'s bytes (Codon str is byte-indexed)."""
+    _build_table()
+    crc = u32(0xFFFFFFFF)
+    n = len(data)
+    i = 0
+    while i < n:
+        idx = int((crc ^ u32(byte_at(data, i))) & u32(0xFF))
+        crc = _TABLE[idx] ^ (crc >> u32(8))
+        i += 1
+    return crc ^ u32(0xFFFFFFFF)

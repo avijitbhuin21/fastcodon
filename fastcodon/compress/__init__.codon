@@ -1,0 +1,5 @@
+# fastcodon.compress — L6.1: pure-Codon CRC-32 + DEFLATE (RFC 1951) + gzip (RFC 1952).
+# A standalone codec (no FFI) usable beyond the web layer; powers GZipMiddleware.
+from .crc32 import crc32
+from .deflate import deflate
+from .gzip import gzip_compress

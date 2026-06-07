@@ -1,8 +1,11 @@
 # fastcodon.json.decoder — str -> JsonValue (RFC 8259).
 #
-# A simple recursive-descent parser. The cursor position is carried in a one-element list so the
-# helpers can advance it (Codon has no `nonlocal`-friendly closures across these recursive calls;
-# a mutable boxed int is the clean idiom).
+# Recursive-descent parser. It is EXCEPTION-FREE internally: `_err` sets an `ok` flag (instead of
+# raising) and every method bails on `not self.ok`, because a raised-and-unwound exception faults
+# this toolchain. Two entry points:
+#   * `try_loads(s) -> (ok, value)` — never raises; use on untrusted input (request bodies).
+#   * `loads(s) -> value`           — raises ValueError on malformed input (back-compat API); only
+#                                     safe on input known to be valid (raising crashes here).
 from ..sys.buf import byte_at, bytes_to_str
 from .value import JsonValue
 
@@ -11,14 +14,21 @@ class _Parser:
     s: str
     n: int
     pos: int
+    ok: bool
+    errmsg: str
 
     def __init__(self, s: str):
         self.s = s
         self.n = len(s)
         self.pos = 0
+        self.ok = True
+        self.errmsg = ""
 
     def _err(self, msg: str):
-        raise ValueError("JSON parse error at " + str(self.pos) + ": " + msg)
+        # Record the first error and stop; do NOT raise (exception unwinding faults this toolchain).
+        if self.ok:
+            self.ok = False
+            self.errmsg = "JSON parse error at " + str(self.pos) + ": " + msg
 
     def _peek(self) -> int:
         if self.pos >= self.n:
@@ -28,7 +38,6 @@ class _Parser:
     def _skip_ws(self):
         while self.pos < self.n:
             c = byte_at(self.s, self.pos)
-            # space, tab, newline, carriage return
             if c == 32 or c == 9 or c == 10 or c == 13:
                 self.pos += 1
             else:
@@ -37,16 +46,22 @@ class _Parser:
     def parse(self) -> JsonValue:
         self._skip_ws()
         v = self._value()
+        if not self.ok:
+            return JsonValue.null()
         self._skip_ws()
         if self.pos != self.n:
             self._err("trailing characters after JSON value")
+            return JsonValue.null()
         return v
 
     def _value(self) -> JsonValue:
+        if not self.ok:
+            return JsonValue.null()
         self._skip_ws()
         c = self._peek()
         if c == -1:
             self._err("unexpected end of input")
+            return JsonValue.null()
         if c == 123:   # {
             return self._object()
         if c == 91:    # [
@@ -62,16 +77,18 @@ class _Parser:
         if c == 45 or (48 <= c <= 57):   # - or digit
             return self._number()
         self._err("unexpected character")
-        return JsonValue.null()  # unreachable
+        return JsonValue.null()
 
     def _literal(self, word: str, val: JsonValue) -> JsonValue:
         wl = len(word)
         if self.pos + wl > self.n:
             self._err("unexpected end while reading literal")
+            return JsonValue.null()
         i = 0
         while i < wl:
             if byte_at(self.s, self.pos + i) != byte_at(word, i):
                 self._err("invalid literal")
+                return JsonValue.null()
             i += 1
         self.pos += wl
         return val
@@ -87,12 +104,18 @@ class _Parser:
             self._skip_ws()
             if self._peek() != 34:
                 self._err("expected string key in object")
+                break
             key = self._string()
+            if not self.ok:
+                break
             self._skip_ws()
             if self._peek() != 58:   # :
                 self._err("expected ':' in object")
+                break
             self.pos += 1
             val = self._value()
+            if not self.ok:
+                break
             d[key] = val
             self._skip_ws()
             c = self._peek()
@@ -103,6 +126,7 @@ class _Parser:
                 self.pos += 1
                 break
             self._err("expected ',' or '}' in object")
+            break
         return JsonValue.object(d)
 
     def _array(self) -> JsonValue:
@@ -114,6 +138,8 @@ class _Parser:
             return JsonValue.array(items)
         while True:
             val = self._value()
+            if not self.ok:
+                break
             items.append(val)
             self._skip_ws()
             c = self._peek()
@@ -124,12 +150,14 @@ class _Parser:
                 self.pos += 1
                 break
             self._err("expected ',' or ']' in array")
+            break
         return JsonValue.array(items)
 
     def _hex4(self) -> int:
         # read exactly 4 hex digits at current pos; advance pos by 4
         if self.pos + 4 > self.n:
             self._err("incomplete \\u escape")
+            return 0
         val = 0
         i = 0
         while i < 4:
@@ -143,6 +171,7 @@ class _Parser:
                 d = c - 65 + 10
             else:
                 self._err("invalid hex digit in \\u escape")
+                return 0
             val = (val << 4) | d
             i += 1
         self.pos += 4
@@ -170,6 +199,7 @@ class _Parser:
         while True:
             if self.pos >= self.n:
                 self._err("unterminated string")
+                return bytes_to_str(out)
             c = byte_at(self.s, self.pos)
             self.pos += 1
             if c == 34:    # closing "
@@ -177,6 +207,7 @@ class _Parser:
             if c == 92:    # backslash escape
                 if self.pos >= self.n:
                     self._err("unterminated escape")
+                    return bytes_to_str(out)
                 e = byte_at(self.s, self.pos)
                 self.pos += 1
                 if e == 34:        # \"
@@ -197,21 +228,27 @@ class _Parser:
                     out.append(byte(9))
                 elif e == 117:     # \uXXXX
                     cp = self._hex4()
+                    if not self.ok:
+                        return bytes_to_str(out)
                     # surrogate pair handling
                     if 0xD800 <= cp <= 0xDBFF:
-                        # expect a low surrogate \uXXXX
                         if self.pos + 1 < self.n and byte_at(self.s, self.pos) == 92 and byte_at(self.s, self.pos + 1) == 117:
                             self.pos += 2  # consume \u
                             lo = self._hex4()
+                            if not self.ok:
+                                return bytes_to_str(out)
                             if 0xDC00 <= lo <= 0xDFFF:
                                 cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
                             else:
                                 self._err("invalid low surrogate")
+                                return bytes_to_str(out)
                         else:
                             self._err("expected low surrogate")
+                            return bytes_to_str(out)
                     self._encode_utf8(cp, out)
                 else:
                     self._err("invalid escape character")
+                    return bytes_to_str(out)
             else:
                 out.append(byte(c))
         return bytes_to_str(out)
@@ -230,12 +267,14 @@ class _Parser:
                 self.pos += 1
         else:
             self._err("invalid number")
+            return JsonValue.null()
         # fraction
         if self.pos < self.n and byte_at(self.s, self.pos) == 46:  # .
             is_float = True
             self.pos += 1
             if not (self.pos < self.n and 48 <= byte_at(self.s, self.pos) <= 57):
                 self._err("expected digit after decimal point")
+                return JsonValue.null()
             while self.pos < self.n and 48 <= byte_at(self.s, self.pos) <= 57:
                 self.pos += 1
         # exponent
@@ -250,6 +289,7 @@ class _Parser:
                         self.pos += 1
                 if not (self.pos < self.n and 48 <= byte_at(self.s, self.pos) <= 57):
                     self._err("expected digit in exponent")
+                    return JsonValue.null()
                 while self.pos < self.n and 48 <= byte_at(self.s, self.pos) <= 57:
                     self.pos += 1
         # slice the number text out byte-by-byte (avoid str field access)
@@ -264,5 +304,19 @@ class _Parser:
         return JsonValue.from_int(int(numtext))
 
 
+def try_loads(s: str) -> Tuple[bool, JsonValue]:
+    """Parse JSON without ever raising: returns (ok, value). On failure ok=False and value is null.
+    Use this on untrusted input (request bodies)."""
+    p = _Parser(s)
+    v = p.parse()
+    return (p.ok, v)
+
+
 def loads(s: str) -> JsonValue:
-    return _Parser(s).parse()
+    """Parse JSON, raising ValueError on malformed input. Back-compat API — only safe when the input
+    is known valid (a raised exception faults this toolchain); prefer try_loads for untrusted data."""
+    p = _Parser(s)
+    v = p.parse()
+    if not p.ok:
+        raise ValueError(p.errmsg)
+    return v
